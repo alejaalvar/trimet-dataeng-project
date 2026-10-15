@@ -1,5 +1,6 @@
 
 # backup.py
+
 import json
 import time
 import os
@@ -14,8 +15,6 @@ from google.cloud import pubsub_v1
 # Configuration
 PROJECT_ID = 'dataeng-project-511504'
 SUBSCRIPTION_ID = 'backup_sub'
-
-# Wait 5 minutes without messages if no sentinel arrives
 IDLE_SECONDS = 300
 
 subscriber = pubsub_v1.SubscriberClient()
@@ -32,8 +31,8 @@ lock = Lock()
 stop_event = Event()
 
 
+# Initialize statistics
 def reset_stats():
-    """Initialize statistics for the next batch."""
     return {
         'first_received': None,
         'first_monotonic': None,
@@ -50,17 +49,19 @@ def reset_stats():
 stats = reset_stats()
 
 
+# Create daily backup file
 def open_backup_file(received_at):
-    """Create a daily backup file."""
 
     date_str = received_at.strftime('%Y-%m-%d')
     filename = f'breadcrumbs_{date_str}_.log'
 
-    # Avoid overwriting a previous completed batch
-    if os.path.exists(filename) or os.path.exists(
-        filename + '.gz'
+    # Prevent overwriting earlier backups
+    if (
+        os.path.exists(filename)
+        or os.path.exists(filename + '.gz')
     ):
         batch = 2
+
         while (
             os.path.exists(
                 f'breadcrumbs_{date_str}_{batch}.log'
@@ -79,14 +80,12 @@ def open_backup_file(received_at):
     logging.info('Started backup: %s', filename)
 
 
+# Log completed backup statistics
 def log_statistics(file_size, compressed_at, elapsed):
-    """Log completed backup statistics."""
 
     count = stats['breadcrumb_count']
 
-    throughput = (
-        count / elapsed if elapsed > 0 else 0
-    )
+    throughput = count / elapsed if elapsed > 0 else 0
 
     logging.info('========== BACKUP STATISTICS ==========')
 
@@ -133,8 +132,8 @@ def log_statistics(file_size, compressed_at, elapsed):
     logging.info('=======================================')
 
 
+# Close and compress backup file
 def finish_backup():
-    """Close, compress, and report the completed batch."""
     global stats
 
     if stats['breadcrumb_count'] == 0:
@@ -144,30 +143,28 @@ def finish_backup():
     compressed_filename = filename + '.gz'
     temporary_filename = compressed_filename + '.tmp'
 
-    # Flush and close the original backup file
+    # Flush and close original file
     if stats['file'] is not None:
         stats['file'].flush()
         stats['file'].close()
         stats['file'] = None
 
-    # Record uncompressed backup size
+    # Record file size before compression
     file_size = os.path.getsize(filename)
 
-    # Compress without loading entire file into memory
+    # Compress file in chunks
     with open(filename, 'rb') as source:
         with gzip.open(temporary_filename, 'wb') as dest:
             shutil.copyfileobj(source, dest)
 
-    # Replace temporary file with completed archive
     os.replace(
         temporary_filename,
         compressed_filename
     )
 
-    # Remove uncompressed file after successful compression
+    # Remove original uncompressed file
     os.remove(filename)
 
-    # Timestamp after compression finishes
     compressed_at = datetime.now(timezone.utc)
 
     elapsed = (
@@ -185,8 +182,8 @@ def finish_backup():
     stats = reset_stats()
 
 
+# Process incoming Pub/Sub messages
 def callback(message):
-    """Receive and back up Pub/Sub messages."""
     global stats
 
     received_at = datetime.now(timezone.utc)
@@ -202,18 +199,18 @@ def callback(message):
 
         with lock:
 
-            # Sentinel indicates expected breadcrumb count
+            # Check for sentinel message
             if payload.get('type') == 'sentinel':
 
-                stats['sentinel_received'] = True
-                stats['expected_count'] = int(
-                    payload['message_count']
-                )
+                expected = int(payload['message_count'])
 
-                if stats['expected_count'] < 0:
+                if expected < 0:
                     raise ValueError('Invalid message count')
 
-                # Check whether all records have arrived
+                stats['sentinel_received'] = True
+                stats['expected_count'] = expected
+
+                # Finish if all breadcrumbs have arrived
                 if (
                     stats['breadcrumb_count']
                     >= stats['expected_count']
@@ -222,29 +219,29 @@ def callback(message):
 
             else:
 
-                # Validate vehicle ID
                 vehicle_id = payload.get('VEHICLE_ID')
 
                 if vehicle_id is None:
                     raise ValueError('Missing VEHICLE_ID')
 
-                # First breadcrumb opens the daily file
+                # First breadcrumb starts a new batch
                 if stats['first_received'] is None:
+
                     open_backup_file(received_at)
 
                     stats['first_received'] = received_at
                     stats['first_monotonic'] = received_mono
 
-                # Write original JSON directly to disk
+                # Append raw JSON to file
                 stats['file'].write(message.data + b'\n')
                 stats['file'].flush()
 
-                # Update aggregate statistics
+                # Update statistics
                 stats['breadcrumb_count'] += 1
                 stats['vehicle_ids'].add(vehicle_id)
                 stats['last_monotonic'] = received_mono
 
-                # A sentinel can arrive before the final record
+                # Sentinel may arrive before last breadcrumb
                 if (
                     stats['sentinel_received']
                     and stats['expected_count'] is not None
@@ -260,15 +257,12 @@ def callback(message):
         message.ack()
 
     except Exception:
-        logging.exception('Backup processing error')
+        logging.exception('Error processing message')
         message.nack()
 
 
+# Check whether batch has finished
 def check_batch_completion():
-    """
-    Fallback for publishers without sentinel messages.
-    Finish after IDLE_SECONDS without new breadcrumbs.
-    """
     global stats
 
     while not stop_event.wait(5):
@@ -278,7 +272,7 @@ def check_batch_completion():
             if stats['breadcrumb_count'] == 0:
                 continue
 
-            # Once sentinel arrives, wait for expected count
+            # If sentinel received, wait for expected count
             if stats['sentinel_received']:
                 continue
 
@@ -296,61 +290,64 @@ def check_batch_completion():
 
                 try:
                     finish_backup()
+
                 except Exception:
                     logging.exception(
                         'Failed to finish backup'
                     )
 
 
-def main():
-    logging.info(
-        'Backup subscriber listening on %s',
-        sub_path
-    )
+# Start background inactivity checker
+checker = Thread(
+    target=check_batch_completion,
+    daemon=True
+)
 
-    # Background thread checks completion
-    checker = Thread(
-        target=check_batch_completion,
-        daemon=True
-    )
-    checker.start()
+checker.start()
 
-    try:
-        with subscriber:
+logging.info(
+    'Backup subscriber listening on %s',
+    sub_path
+)
 
-            # Keep listening indefinitely
-            while not stop_event.is_set():
+logging.info(
+    'Batch inactivity threshold: %d seconds',
+    IDLE_SECONDS
+)
 
-                streaming_pull = subscriber.subscribe(
-                    sub_path,
-                    callback=callback
+
+# Start subscriber directly (no main function)
+try:
+    with subscriber:
+
+        while not stop_event.is_set():
+
+            streaming_pull = subscriber.subscribe(
+                sub_path,
+                callback=callback
+            )
+
+            try:
+                streaming_pull.result()
+
+            except KeyboardInterrupt:
+                logging.info('Stopping backup...')
+                stop_event.set()
+                streaming_pull.cancel()
+                break
+
+            except Exception:
+                logging.exception(
+                    'Connection interrupted. Reconnecting...'
                 )
 
-                try:
-                    streaming_pull.result()
+                streaming_pull.cancel()
+                time.sleep(5)
 
-                except KeyboardInterrupt:
-                    logging.info('Stopping backup...')
-                    stop_event.set()
-                    streaming_pull.cancel()
-                    break
+finally:
+    stop_event.set()
 
-                except Exception:
-                    logging.exception(
-                        'Connection interrupted. Reconnecting...'
-                    )
-
-                    streaming_pull.cancel()
-                    time.sleep(5)
-
-    finally:
-        stop_event.set()
-
-        with lock:
-            if stats['file'] is not None:
-                stats['file'].flush()
-                stats['file'].close()
-
-
-if __name__ == '__main__':
-    main()
+    with lock:
+        if stats['file'] is not None:
+            stats['file'].flush()
+            stats['file'].close()
