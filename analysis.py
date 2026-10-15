@@ -1,5 +1,6 @@
 
 # analysis.py
+
 import json
 import time
 import logging
@@ -11,9 +12,6 @@ from google.cloud import pubsub_v1
 # Configuration
 PROJECT_ID = 'dataeng-project-511504'
 SUBSCRIPTION_ID = 'analysis_sub'
-
-# Wait 5 minutes after the last message
-# before treating the batch as complete.
 IDLE_SECONDS = 300
 
 subscriber = pubsub_v1.SubscriberClient()
@@ -30,8 +28,8 @@ lock = Lock()
 stop_event = Event()
 
 
+# Initialize statistics
 def reset_stats():
-    """Reset statistics for the next batch."""
     return {
         'first_received': None,
         'last_received': None,
@@ -49,42 +47,21 @@ def reset_stats():
 stats = reset_stats()
 
 
+# Parse TriMet breadcrumb timestamp
 def parse_breadcrumb_time(payload):
-    """Combine OPD_DATE and ACT_TIME."""
 
-    opd_date = str(payload['OPD_DATE']).strip()
-    act_time = payload['ACT_TIME']
+    date = datetime.strptime(
+        payload['OPD_DATE'],
+        '%d%b%Y:%H:%M:%S'
+    )
 
-    # Support common date formats
-    date = None
-
-    for fmt in ('%Y-%m-%d', '%m/%d/%Y', '%d-%b-%y'):
-        try:
-            date = datetime.strptime(opd_date, fmt)
-            break
-        except ValueError:
-            continue
-
-    if date is None:
-        raise ValueError(f'Unknown date format: {opd_date}')
-
-    # ACT_TIME may be seconds after midnight
-    # or a HH:MM:SS formatted string.
-    if isinstance(act_time, str) and ':' in act_time:
-        parts = list(map(int, act_time.split(':')))
-        seconds = (
-            parts[0] * 3600
-            + parts[1] * 60
-            + parts[2]
-        )
-    else:
-        seconds = int(act_time)
+    seconds = int(payload['ACT_TIME'])
 
     return date + timedelta(seconds=seconds)
 
 
+# Log statistics for completed batch
 def log_statistics():
-    """Print statistics for the completed batch."""
 
     count = stats['breadcrumb_count']
 
@@ -98,7 +75,7 @@ def log_statistics():
 
     throughput = count / elapsed if elapsed > 0 else 0
 
-    logging.info('========== BATCH STATISTICS ==========')
+    logging.info('========== ANALYSIS STATISTICS ==========')
 
     logging.info(
         'First breadcrumb received: %s',
@@ -131,7 +108,7 @@ def log_statistics():
     )
 
     logging.info(
-        'Last message received: %s',
+        'Last breadcrumb received: %s',
         stats['last_received'].isoformat()
     )
 
@@ -150,11 +127,11 @@ def log_statistics():
         stats['invalid_count']
     )
 
-    logging.info('======================================')
+    logging.info('=========================================')
 
 
+# Process incoming Pub/Sub messages
 def callback(message):
-    """Process each incoming breadcrumb."""
     global stats
 
     received_at = datetime.now(timezone.utc)
@@ -168,7 +145,6 @@ def callback(message):
         if not isinstance(payload, dict):
             raise ValueError('Expected JSON object')
 
-        # Extract only the fields needed
         vehicle_id = payload.get('VEHICLE_ID')
         trip_id = payload.get('EVENT_NO_TRIP')
 
@@ -179,57 +155,45 @@ def callback(message):
 
         with lock:
 
-            # Track first breadcrumb arrival
             if stats['first_received'] is None:
                 stats['first_received'] = received_at
                 stats['first_monotonic'] = received_mono
 
-            # Track last breadcrumb arrival
             stats['last_received'] = received_at
             stats['last_monotonic'] = received_mono
 
-            # Count breadcrumbs
             stats['breadcrumb_count'] += 1
 
-            # Track unique vehicles and trips
             stats['vehicle_ids'].add(vehicle_id)
             stats['trip_ids'].add(trip_id)
 
-            # Update earliest breadcrumb timestamp
             if (
                 stats['earliest_breadcrumb'] is None
                 or breadcrumb_time < stats['earliest_breadcrumb']
             ):
                 stats['earliest_breadcrumb'] = breadcrumb_time
 
-            # Update latest breadcrumb timestamp
             if (
                 stats['latest_breadcrumb'] is None
                 or breadcrumb_time > stats['latest_breadcrumb']
             ):
                 stats['latest_breadcrumb'] = breadcrumb_time
 
-        # Acknowledge successfully processed message
         message.ack()
 
     except (ValueError, KeyError, TypeError, OverflowError):
         with lock:
             stats['invalid_count'] += 1
-        # Skip malformed records rather than retry forever
+
         message.ack()
 
     except Exception:
-        logging.exception('Unexpected processing error')
+        logging.exception('Error processing message')
         message.nack()
 
 
+# Check for completion after inactivity
 def check_batch_completion():
-    """
-    Check whether the publisher appears finished.
-
-    A batch is considered complete after
-    IDLE_SECONDS without receiving a breadcrumb.
-    """
     global stats
 
     while not stop_event.wait(5):
@@ -253,58 +217,55 @@ def check_batch_completion():
                     idle_time
                 )
 
-                # Reset for next day's batch
                 stats = reset_stats()
 
 
-def main():
-    logging.info(
-        'Listening on %s',
-        sub_path
-    )
+# Start background inactivity checker
+checker = Thread(
+    target=check_batch_completion,
+    daemon=True
+)
 
-    logging.info(
-        'Batch inactivity threshold: %d seconds',
-        IDLE_SECONDS
-    )
+checker.start()
 
-    # Start background completion checker
-    checker = Thread(
-        target=check_batch_completion,
-        daemon=True
-    )
-    checker.start()
+logging.info(
+    'Analysis subscriber listening on %s',
+    sub_path
+)
 
-    # Subscriber runs continuously
-    try:
-        with subscriber:
+logging.info(
+    'Batch inactivity threshold: %d seconds',
+    IDLE_SECONDS
+)
 
-            while not stop_event.is_set():
 
-                streaming_pull = subscriber.subscribe(
-                    sub_path,
-                    callback=callback
+# Start subscriber directly (no main function)
+try:
+    with subscriber:
+
+        while not stop_event.is_set():
+
+            streaming_pull = subscriber.subscribe(
+                sub_path,
+                callback=callback
+            )
+
+            try:
+                streaming_pull.result()
+
+            except KeyboardInterrupt:
+                logging.info('Stopping subscriber...')
+                stop_event.set()
+                streaming_pull.cancel()
+                break
+
+            except Exception:
+                logging.exception(
+                    'Connection interrupted. Reconnecting...'
                 )
 
-                try:
-                    streaming_pull.result()
+                streaming_pull.cancel()
+                time.sleep(5)
 
-                except KeyboardInterrupt:
-                    logging.info('Stopping subscriber...')
-                    stop_event.set()
-                    streaming_pull.cancel()
-                    break
-
-                except Exception:
-                    logging.exception(
-                        'Connection interrupted. Reconnecting...'
-                    )
-                    streaming_pull.cancel()
-                    time.sleep(5)
-
-    finally:
-        stop_event.set()
-
-
-if __name__ == '__main__':
-    main()
+finally:
+    stop_event.set()
