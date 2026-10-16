@@ -1,4 +1,3 @@
-
 # analysis.py
 
 import json
@@ -12,7 +11,7 @@ from google.cloud import pubsub_v1
 # Configuration
 PROJECT_ID = 'dataeng-project-511504'
 SUBSCRIPTION_ID = 'analysis_sub'
-IDLE_SECONDS = 300
+IDLE_SECONDS = 300  # 5 minutes means the day's run is done
 
 subscriber = pubsub_v1.SubscriberClient()
 sub_path = subscriber.subscription_path(
@@ -20,12 +19,13 @@ sub_path = subscriber.subscription_path(
 )
 
 logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    level=logging.INFO,  # the threshold for what severity of message gets logged
+    format='%(asctime)s - %(levelname)s - %(message)s'  # layout of each entry
 )
 
+# we prevent race conditions on shared global statistics using a lock
 lock = Lock()
-stop_event = Event()
+stop_event = Event()  # used to cleanly shut down background processes
 
 
 # Initialize statistics
@@ -37,13 +37,15 @@ def reset_stats():
         'last_monotonic': None,
         'earliest_breadcrumb': None,
         'latest_breadcrumb': None,
-        'vehicle_ids': set(),
+        'vehicle_ids': set(),  # sets enforce uniqueness
         'trip_ids': set(),
         'breadcrumb_count': 0,
         'invalid_count': 0
     }
 
-
+# because we track stats day by day without restarting the program,
+# we need to wipe the dictionary at the end of each daily run. this
+# global variable is what we will be modifying
 stats = reset_stats()
 
 
@@ -61,10 +63,13 @@ def parse_breadcrumb_time(payload):
 
 
 # Log statistics for completed batch
+# this is run after 5 minutes of inactivity, signaling
+# that all messages have been received and processed
 def log_statistics():
 
     count = stats['breadcrumb_count']
 
+    # avoid logging an empty report
     if count == 0:
         return
 
@@ -138,6 +143,7 @@ def callback(message):
     received_mono = time.monotonic()
 
     try:
+      # decode the raw bytes and convert to python dict
         payload = json.loads(
             message.data.decode('utf-8')
         )
@@ -150,11 +156,14 @@ def callback(message):
 
         breadcrumb_time = parse_breadcrumb_time(payload)
 
+        # handle incomplete data gracefully
         if vehicle_id is None or trip_id is None:
             raise ValueError('Missing vehicle or trip ID')
 
+        # acquire the lock before touching global stats
         with lock:
 
+            # checking if this is the very first message of the day
             if stats['first_received'] is None:
                 stats['first_received'] = received_at
                 stats['first_monotonic'] = received_mono
@@ -167,24 +176,29 @@ def callback(message):
             stats['vehicle_ids'].add(vehicle_id)
             stats['trip_ids'].add(trip_id)
 
+            # is the current earliest breadcrumb value actually the earliest?
             if (
                 stats['earliest_breadcrumb'] is None
                 or breadcrumb_time < stats['earliest_breadcrumb']
             ):
                 stats['earliest_breadcrumb'] = breadcrumb_time
 
+            # is the current latest breadcrumb value actually the latest?
             if (
                 stats['latest_breadcrumb'] is None
                 or breadcrumb_time > stats['latest_breadcrumb']
             ):
                 stats['latest_breadcrumb'] = breadcrumb_time
 
+        # processing succeeded as normal, make sure the message is removed
+        # from the queue
         message.ack()
 
     except (ValueError, KeyError, TypeError, OverflowError):
         with lock:
             stats['invalid_count'] += 1
 
+        # prevent bad data from clogging the queue by deleting it
         message.ack()
 
     except Exception:
@@ -193,9 +207,11 @@ def callback(message):
 
 
 # Check for completion after inactivity
+# this function gets run in a background thread, checker
 def check_batch_completion():
     global stats
 
+    # every 5 secs we ask, how long since we received the last message?
     while not stop_event.wait(5):
 
         with lock:
@@ -208,6 +224,7 @@ def check_batch_completion():
                 - stats['last_monotonic']
             )
 
+            # if 5 minutes has elapsed, the publisher is finished
             if idle_time >= IDLE_SECONDS:
 
                 log_statistics()
@@ -217,6 +234,7 @@ def check_batch_completion():
                     idle_time
                 )
 
+                # clear the dict for the next day's run
                 stats = reset_stats()
 
 
@@ -239,12 +257,13 @@ logging.info(
 )
 
 
-# Start subscriber directly (no main function)
+# this is our long running execution block
 try:
     with subscriber:
 
         while not stop_event.is_set():
 
+            # establish the connection to pub-sub
             streaming_pull = subscriber.subscribe(
                 sub_path,
                 callback=callback
