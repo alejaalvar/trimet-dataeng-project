@@ -1,4 +1,3 @@
-
 # backup.py
 
 import json
@@ -272,16 +271,25 @@ def check_batch_completion():
             if stats['breadcrumb_count'] == 0:
                 continue
 
-            # If sentinel received, wait for expected count
-            if stats['sentinel_received']:
-                continue
-
             idle_time = (
                 time.monotonic()
                 - stats['last_monotonic']
             )
 
             if idle_time >= IDLE_SECONDS:
+
+                # sentinel arrived but we never reached its count,
+                # meaning some breadcrumbs were invalid or never delivered
+                if (
+                    stats['sentinel_received']
+                    and stats['expected_count'] is not None
+                    and stats['breadcrumb_count'] < stats['expected_count']
+                ):
+                    logging.warning(
+                        'Finishing with %d of %d expected breadcrumbs',
+                        stats['breadcrumb_count'],
+                        stats['expected_count']
+                    )
 
                 logging.info(
                     'No messages for %.0f seconds.',
