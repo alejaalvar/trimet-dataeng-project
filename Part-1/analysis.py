@@ -3,6 +3,8 @@
 import json
 import time
 import logging
+import psycopg2
+import os
 from datetime import datetime, timedelta, timezone
 from threading import Lock, Event, Thread
 
@@ -12,6 +14,27 @@ from google.cloud import pubsub_v1
 PROJECT_ID = 'dataeng-project-511504'
 SUBSCRIPTION_ID = 'analysis_sub'
 IDLE_SECONDS = 300  # 5 minutes means the day's run is done
+
+# PostgreSQL configuration
+DB_HOST = "localhost"
+DB_PORT = 5432
+DB_NAME = "breadcrumbs"
+DB_USER = os.environ["DB_USER"]
+DB_PASS = os.environ["DB_PASSWORD"]
+
+# Connect to PostgreSQL
+conn = psycopg2.connect(
+    host=DB_HOST,
+    port=DB_PORT,
+    dbname=DB_NAME,
+    user=DB_USER,
+    password=DB_PASS
+)
+
+conn.autocommit = True
+
+# Lock for database operations
+db_lock = Lock()
 
 subscriber = pubsub_v1.SubscriberClient()
 sub_path = subscriber.subscription_path(
@@ -60,6 +83,29 @@ def parse_breadcrumb_time(payload):
     seconds = int(payload['ACT_TIME'])
 
     return date + timedelta(seconds=seconds)
+
+# Insert valid breadcrumb into PostgreSQL
+def insert_breadcrumb(payload, breadcrumb_time):
+
+    sql = """
+        INSERT INTO breadcrumb
+        (trip_id, vehicle_id, timestamp, latitude, longitude, speed, meters)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
+    """
+
+    values = (
+        int(payload['EVENT_NO_TRIP']),
+        int(payload['VEHICLE_ID']),
+        breadcrumb_time,
+        float(payload['GPS_LATITUDE']),
+        float(payload['GPS_LONGITUDE']),
+        float(payload['VELOCITY']) if payload.get('VELOCITY') is not None else None,
+        int(payload['METERS']) if payload.get('METERS') is not None else None
+    )
+
+    with db_lock:
+        with conn.cursor() as cur:
+            cur.execute(sql, values)
 
 
 # Log statistics for completed batch
@@ -159,6 +205,8 @@ def callback(message):
         # handle incomplete data gracefully
         if vehicle_id is None or trip_id is None:
             raise ValueError('Missing vehicle or trip ID')
+
+        insert_breadcrumb(payload, breadcrumb_time)
 
         # acquire the lock before touching global stats
         with lock:
