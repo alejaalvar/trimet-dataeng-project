@@ -38,8 +38,6 @@ def reset_stats():
         'last_monotonic': None,
         'vehicle_ids': set(),
         'breadcrumb_count': 0,
-        'expected_count': None,
-        'sentinel_received': False,
         'file': None,
         'filename': None
     }
@@ -150,6 +148,7 @@ def finish_backup():
 
     # Record file size before compression
     file_size = os.path.getsize(filename)
+    compress_start = time.monotonic()
 
     # Compress file in chunks
     with open(filename, 'rb') as source:
@@ -166,10 +165,14 @@ def finish_backup():
 
     compressed_at = datetime.now(timezone.utc)
 
-    elapsed = (
-        time.monotonic()
+    # The batch is only known to be over after IDLE_SECONDS of silence, so
+    # that idle wait is excluded: elapsed = receive time + compression time.
+    receive_seconds = (
+        stats['last_monotonic']
         - stats['first_monotonic']
     )
+    compress_seconds = time.monotonic() - compress_start
+    elapsed = receive_seconds + compress_seconds
 
     log_statistics(
         file_size,
@@ -198,56 +201,27 @@ def callback(message):
 
         with lock:
 
-            # Check for sentinel message
-            if payload.get('type') == 'sentinel':
+            vehicle_id = payload.get('VEHICLE_ID')
 
-                expected = int(payload['message_count'])
+            if vehicle_id is None:
+                raise ValueError('Missing VEHICLE_ID')
 
-                if expected < 0:
-                    raise ValueError('Invalid message count')
+            # First breadcrumb starts a new batch
+            if stats['first_received'] is None:
 
-                stats['sentinel_received'] = True
-                stats['expected_count'] = expected
+                open_backup_file(received_at)
 
-                # Finish if all breadcrumbs have arrived
-                if (
-                    stats['breadcrumb_count']
-                    >= stats['expected_count']
-                ):
-                    finish_backup()
+                stats['first_received'] = received_at
+                stats['first_monotonic'] = received_mono
 
-            else:
+            # Append raw JSON to file
+            stats['file'].write(message.data + b'\n')
+            stats['file'].flush()
 
-                vehicle_id = payload.get('VEHICLE_ID')
-
-                if vehicle_id is None:
-                    raise ValueError('Missing VEHICLE_ID')
-
-                # First breadcrumb starts a new batch
-                if stats['first_received'] is None:
-
-                    open_backup_file(received_at)
-
-                    stats['first_received'] = received_at
-                    stats['first_monotonic'] = received_mono
-
-                # Append raw JSON to file
-                stats['file'].write(message.data + b'\n')
-                stats['file'].flush()
-
-                # Update statistics
-                stats['breadcrumb_count'] += 1
-                stats['vehicle_ids'].add(vehicle_id)
-                stats['last_monotonic'] = received_mono
-
-                # Sentinel may arrive before last breadcrumb
-                if (
-                    stats['sentinel_received']
-                    and stats['expected_count'] is not None
-                    and stats['breadcrumb_count']
-                    >= stats['expected_count']
-                ):
-                    finish_backup()
+            # Update statistics
+            stats['breadcrumb_count'] += 1
+            stats['vehicle_ids'].add(vehicle_id)
+            stats['last_monotonic'] = received_mono
 
         message.ack()
 
@@ -278,19 +252,7 @@ def check_batch_completion():
 
             if idle_time >= IDLE_SECONDS:
 
-                # sentinel arrived but we never reached its count,
-                # meaning some breadcrumbs were invalid or never delivered
-                if (
-                    stats['sentinel_received']
-                    and stats['expected_count'] is not None
-                    and stats['breadcrumb_count'] < stats['expected_count']
-                ):
-                    logging.warning(
-                        'Finishing with %d of %d expected breadcrumbs',
-                        stats['breadcrumb_count'],
-                        stats['expected_count']
-                    )
-
+                # No messages for IDLE_SECONDS: the day's batch is over
                 logging.info(
                     'No messages for %.0f seconds.',
                     idle_time
