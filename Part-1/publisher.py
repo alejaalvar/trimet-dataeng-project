@@ -283,8 +283,6 @@ run_id = str(uuid.uuid4())
 start_time = time.perf_counter()
 api_start_timestamp = datetime.now(timezone.utc)
 
-sentinel_timestamp = None
-
 # allows TCP connection pooling to prevent overhead of re-establishing a
 # connection for each of the 250 vehicles
 session = requests.Session()
@@ -338,7 +336,7 @@ for vehicle in VEHICLE_IDS:
             publishing_errors += 1
 
     # confirm this vehicle's messages before moving to the next vehicle.
-    # only confirmed publishes are counted, so the sentinel's count stays accurate,
+    # only confirmed publishes are counted, so the published count stays accurate,
     # and the futures list is discarded each iteration so memory stays bounded
     for future in futures:
         try:
@@ -352,27 +350,9 @@ for vehicle in VEHICLE_IDS:
 # remember to close the session since we kept a connection pool
 session.close()
 
-sentinel_timestamp = datetime.now(timezone.utc)
-
-# Construct and publish the sentinel message
-sentinel_payload = {
-    "type": "sentinel",
-    "run_id": run_id,
-    "message_count": total_breadcrumbs,
-    "timestamp": sentinel_timestamp.isoformat(),
-}
-
-try:
-    # Serialize and publish sentinel
-    sentinel_message = json.dumps(sentinel_payload).encode("utf-8")
-    sentinel_future = publisher.publish(topic_path, sentinel_message)
-    sentinel_future.result()  # blocks until published
-
-    print(
-        f"Successfully published sentinel message for run {run_id} containing count: {total_breadcrumbs}"
-    )
-except Exception as e:
-    print(f"Failed to publish sentinel message: {e}")
+# No sentinel message is published. The subscribers detect the end of the
+# day's batch by inactivity (no messages for IDLE_SECONDS).
+publish_end_timestamp = datetime.now(timezone.utc)
 
 end_time = time.perf_counter()
 elapsed_time = end_time - start_time
@@ -382,7 +362,7 @@ print("\nPublisher Statistics:")
 print("--------------------")
 print(f"RunID: {run_id}")
 print(f"API Start Timestamp: {api_start_timestamp}")
-print(f"Sentinel Sent Timestamp: {sentinel_timestamp}")
+print(f"Publishing End Timestamp: {publish_end_timestamp}")
 print(f"Elapsed Wall-Clock Time: {elapsed_time:.2f} seconds")
 print(f"Total Breadcrumbs Published: {total_breadcrumbs}")
 print(f"Publishing Throughput: {throughput:.2f} breadcrumbs/second")
