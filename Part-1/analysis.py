@@ -9,6 +9,14 @@ from datetime import datetime, timedelta, timezone
 from threading import Lock, Event, Thread
 
 import psycopg2
+
+
+import warnings
+
+# Google warns that future library releases will drop Python 3.11; current versions work fine.
+# ideally, we'd be using a venv for this
+warnings.filterwarnings("ignore", message="You are using a Python version", category=FutureWarning)
+
 from google.cloud import pubsub_v1
 
 # Configuration
