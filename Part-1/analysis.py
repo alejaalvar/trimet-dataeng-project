@@ -97,6 +97,20 @@ def validate_record(record):
     trip_id = record.get('EVENT_NO_TRIP')
     act_time = record.get('ACT_TIME')
 
+    # A1/A2: GPS coordinates must be non-null and within valid ranges
+    for code, field, low, high in (
+        ("A1", "GPS_LATITUDE", -90, 90),
+        ("A2", "GPS_LONGITUDE", -180, 180),
+    ):
+        message = f"{code}: {field} must be non-null and in the range [{low}, {high}]"
+        try:
+            value = require_number(record.get(field), field)
+        except (ValueError, TypeError, OverflowError):
+            violations.append(message)
+            continue
+        if not low <= value <= high:
+            violations.append(message)
+
     if vehicle_id is None or str(vehicle_id).strip() == '':
         violations.append('A3: VEHICLE_ID must exist')
     if trip_id is None or str(trip_id).strip() == '':
