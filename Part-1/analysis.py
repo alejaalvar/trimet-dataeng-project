@@ -79,18 +79,34 @@ def require_number(value, field):
 
 
 def calculate_speed(record, breadcrumb_time, previous):
-    """Speed in m/s relative to the latest accepted earlier trip record.
-
-    First record of a trip has speed 0.0. Out-of-order records with no
-    earlier accepted reference have speed 0.0 provisionally.
-    """
+    # Updated calculate_speed() to calculate speed using the difference in METERS and elapsed time between consecutive breadcrumbs.
+    # The function now uses the previous record stored in trip_state and checks that both records belong to the same vehicle.
+    # The first record of each trip receives a speed of 0.0. Added checks to prevent division by zero, negative time differences, and negative distance differences.
+    # Speed is calculated in meters per second (m/s).
+    # trip_state must be updated after calculating speed to avoid comparing a record against itself.
+  
+    # First breadcrumb of the trip
     if previous is None:
         return 0.0
-    delta_seconds = (breadcrumb_time - previous['timestamp']).total_seconds()
-    if delta_seconds <= 0:
+
+    # Ensure vehicle ID matches
+    if str(record['VEHICLE_ID']) != previous['vehicle_id']:
         return 0.0
-    current_meters = require_number(record['METERS'], 'METERS')
-    delta_meters = current_meters - previous['meters']
+
+    # Calculate difference in distance
+    delta_meters = (
+        float(record['METERS']) - previous['meters']
+    )
+
+    # Calculate difference in time
+    delta_seconds = (
+        breadcrumb_time - previous['timestamp']
+    ).total_seconds()
+
+    # Avoid invalid calculations
+    if delta_seconds <= 0 or delta_meters < 0:
+        return 0.0
+
     return delta_meters / delta_seconds
 
 
