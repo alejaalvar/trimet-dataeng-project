@@ -44,8 +44,13 @@ import sys
 import tempfile
 import types
 import unittest
+import warnings
 from collections import defaultdict
 from datetime import datetime, timedelta
+
+# Same filter as analysis.py. It must run before _stub_missing_modules()
+# below, because that is where google.cloud is first imported (and warns).
+warnings.filterwarnings("ignore", message="You are using a Python version", category=FutureWarning)
 
 PART1_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PART1_DIR)
