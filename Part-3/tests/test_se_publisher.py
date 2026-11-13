@@ -8,6 +8,7 @@ Run from the Part-3 directory:
     python3 -m unittest discover -s tests -v
 """
 
+import json
 import os
 import sys
 import unittest
@@ -187,6 +188,51 @@ class FetchStopEventsTests(unittest.TestCase):
             se_publisher.fetch_stop_events_html(self.session, 4001)
 
         self.assertEqual(self.session.get.call_count, 1)
+
+
+TOPIC_PATH = "projects/test-project/topics/se_topic"
+
+
+class PublishRecordsTests(unittest.TestCase):
+    """publish_records() sends each StopEvent to Pub/Sub as its own message."""
+
+    def setUp(self):
+        """Give each test a fake Pub/Sub publisher client.
+
+        By default, publish() returns a Mock future whose result() succeeds.
+        """
+        self.publisher = mock.Mock()
+        self.records = [
+            {"trip_id": "111", "leave_time": "100"},
+            {"trip_id": "111", "leave_time": "200"},
+        ]
+
+    def test_each_record_is_published_as_its_own_json_message(self):
+        published, errors = se_publisher.publish_records(
+            self.publisher, TOPIC_PATH, self.records
+        )
+
+        calls = self.publisher.publish.call_args_list
+        self.assertEqual([call.args[0] for call in calls], [TOPIC_PATH, TOPIC_PATH])
+        self.assertEqual([json.loads(call.args[1]) for call in calls], self.records)
+        self.assertEqual((published, errors), (2, 0))
+
+    def test_failed_future_counts_as_error_not_published(self):
+        failed_future = mock.Mock()
+        failed_future.result.side_effect = RuntimeError("publish failed")
+        self.publisher.publish.side_effect = [mock.Mock(), failed_future]
+
+        result = se_publisher.publish_records(self.publisher, TOPIC_PATH, self.records)
+
+        self.assertEqual(result, (1, 1))
+
+    def test_publish_call_failure_counts_as_error_and_next_record_is_published(self):
+        self.publisher.publish.side_effect = [RuntimeError("client error"), mock.Mock()]
+
+        result = se_publisher.publish_records(self.publisher, TOPIC_PATH, self.records)
+
+        self.assertEqual(result, (1, 1))
+        self.assertEqual(self.publisher.publish.call_count, 2)
 
 
 if __name__ == "__main__":
