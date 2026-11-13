@@ -1,13 +1,12 @@
-import collections
 import json
-import time
-import requests
 import re
+import time
 import uuid
+from datetime import datetime, timezone
 
+import requests
 from bs4 import BeautifulSoup
 from google.cloud import pubsub_v1
-from datetime import datetime, timezone
 
 # GCP setup
 PUBLISHER_VM_IP = "8.229.127.245"
@@ -272,29 +271,36 @@ VEHICLE_IDS = [
 
 API_URL = "https://busdata.cs.pdx.edu/api/getStopEvents"
 
-publisher = pubsub_v1.PublisherClient()
-topic_path = publisher.topic_path(PROJECT_ID, TOPIC_ID)
+# Each trip's table is introduced by a heading like
+# "Stop events for PDX_TRIP 242538843"; the trip ID appears nowhere else.
+TRIP_ID_PATTERN = re.compile(r"PDX_TRIP\s+(\d+)")
 
-# Statistics
-total_stop_events = 0
-api_errors = 0
-parsing_errors = 0
-publishing_errors = 0
 
-vehicles_with_data = set()
+def find_trip_id(table):
+    """Return the trip ID from the <h2> heading directly before table, or None.
 
-run_id = str(uuid.uuid4())
-start_time = time.perf_counter()
-api_start_timestamp = datetime.now(timezone.utc)
-
-session = requests.Session()
+    Only the immediately preceding sibling is checked, so a table missing its
+    own heading is not credited to the previous trip's heading.
+    """
+    heading = table.find_previous_sibling()
+    if heading is None or heading.name != "h2":
+        return None
+    match = TRIP_ID_PATTERN.search(heading.get_text())
+    return match.group(1) if match else None
 
 
 def parse_stop_events(html):
-    """Extract StopEvent records from the HTML tables."""
+    """Extract StopEvent records from a getStopEvents HTML page.
+
+    Every record gets the trip ID of its table and loses the trip_number
+    column. Returns (records, bad_rows): a malformed row, or a row whose trip
+    is unknown, is skipped and counted rather than failing the whole page, so
+    one bad row does not discard the vehicle's good StopEvents.
+    """
     soup = BeautifulSoup(html, "html.parser")
 
     records = []
+    bad_rows = 0
 
     for table in soup.find_all("table"):
         rows = table.find_all("tr")
@@ -324,14 +330,19 @@ def parse_stop_events(html):
         if not headers:
             continue
 
+        trip_id = find_trip_id(table)
+
         for row in rows[header_index + 1:]:
             cells = row.find_all("td", recursive=False)
 
             if not cells:
                 continue
 
-            if len(cells) != len(headers):
-                raise ValueError("A table row has a different number of cells than headers.")
+            # A StopEvent without a trip ID cannot be joined to its trip
+            # downstream, so it is treated like a malformed row.
+            if trip_id is None or len(cells) != len(headers):
+                bad_rows += 1
+                continue
 
             values = [
                 cell.get_text(" ", strip=True) or None
@@ -339,87 +350,170 @@ def parse_stop_events(html):
             ]
 
             record = dict(zip(headers, values))
+            # Dropped at the professor's request.
+            record.pop("trip_number", None)
+            record["trip_id"] = trip_id
             records.append(record)
 
-    return records
+    return records, bad_rows
 
 
-for vehicle in VEHICLE_IDS:
+def fetch_stop_events_html(session, vehicle):
+    """Return the getStopEvents HTML page for one vehicle, or None if it has no data.
 
-    try:
-        for attempt in range(3):
-            try:
-                response = session.get(
-                    API_URL,
-                    params={"vehicle_num": vehicle},
-                    timeout=10
-                )
-                response.raise_for_status()
-                break
+    Connection errors and timeouts are retried, up to 3 attempts in total;
+    any other HTTP error status is raised immediately without retrying.
+    Raises a requests.RequestException when the page cannot be fetched.
+    """
+    for attempt in range(3):
+        try:
+            response = session.get(
+                API_URL,
+                params={"vehicle_num": vehicle},
+                timeout=10
+            )
 
-            except (requests.ConnectionError, requests.Timeout):
-                if attempt == 2:
-                    raise
+            # BusData answers 404 {"error":"Not Found"} for a vehicle with no
+            # stop events that day, which is normal and not an API failure.
+            if response.status_code == 404:
+                return None
 
-                time.sleep(2 * (attempt + 1))
+            response.raise_for_status()
+            return response.text
 
-    except requests.RequestException:
-        api_errors += 1
-        continue
+        except (requests.ConnectionError, requests.Timeout):
+            if attempt == 2:
+                raise
 
-    try:
-        records = parse_stop_events(response.text)
+            time.sleep(2 * (attempt + 1))
 
-    except Exception:
-        parsing_errors += 1
-        continue
 
-    if records:
-        vehicles_with_data.add(vehicle)
+def publish_records(publisher, topic_path, records):
+    """Publish each record as its own JSON message and wait for confirmation.
 
+    Returns (published, errors). Only confirmed publishes count as published,
+    so the statistics reflect what actually reached Pub/Sub.
+    """
     futures = []
+    errors = 0
 
+    # Everything is handed to the client before any result is awaited so the
+    # client can batch messages instead of making one round trip per record.
     for record in records:
         try:
             message = json.dumps(record).encode("utf-8")
             futures.append(publisher.publish(topic_path, message))
 
         except Exception:
-            publishing_errors += 1
+            errors += 1
+
+    published = 0
 
     for future in futures:
         try:
             future.result()
-            total_stop_events += 1
+            published += 1
 
         except Exception:
-            publishing_errors += 1
+            errors += 1
 
-    time.sleep(0.1)
-
-session.close()
-
-publish_end_timestamp = datetime.now(timezone.utc)
-
-end_time = time.perf_counter()
-elapsed_time = end_time - start_time
-
-throughput = (
-    total_stop_events / elapsed_time
-    if elapsed_time > 0 else 0
-)
+    return published, errors
 
 
-# Print publishing statistics
-print("\nStopEvent Publisher Statistics:")
-print("-------------------------------")
-print(f"RunID: {run_id}")
-print(f"API Start Timestamp: {api_start_timestamp}")
-print(f"Publishing End Timestamp: {publish_end_timestamp}")
-print(f"Elapsed Wall-Clock Time: {elapsed_time:.2f} seconds")
-print(f"Total StopEvents Published: {total_stop_events}")
-print(f"Publishing Throughput: {throughput:.2f} StopEvents/second")
-print(f"Unique Vehicles With Data: {len(vehicles_with_data)}")
-print(f"API Errors: {api_errors}")
-print(f"Parsing Errors: {parsing_errors}")
-print(f"Publishing Errors: {publishing_errors}")
+def run(session, publisher, topic_path, vehicle_ids):
+    """Fetch, parse and publish the StopEvents of every vehicle.
+
+    A failure for one vehicle is counted and the run moves on to the next
+    vehicle. Returns a dict of the run's statistics.
+    """
+    stats = {
+        "run_id": str(uuid.uuid4()),
+        "api_start_timestamp": datetime.now(timezone.utc),
+        "total_stop_events": 0,
+        "api_errors": 0,
+        "parsing_errors": 0,
+        "publishing_errors": 0,
+    }
+    vehicles_with_data = set()
+    vehicles_without_data = set()
+    start_time = time.perf_counter()
+
+    for vehicle in vehicle_ids:
+        try:
+            html = fetch_stop_events_html(session, vehicle)
+
+        except requests.RequestException:
+            stats["api_errors"] += 1
+            continue
+
+        if html is None:
+            vehicles_without_data.add(vehicle)
+            continue
+
+        try:
+            records, bad_rows = parse_stop_events(html)
+
+        # An unexpected page should cost one vehicle, not the whole
+        # scheduled run.
+        except Exception:
+            stats["parsing_errors"] += 1
+            continue
+
+        stats["parsing_errors"] += bad_rows
+
+        if records:
+            vehicles_with_data.add(vehicle)
+        else:
+            vehicles_without_data.add(vehicle)
+
+        published, errors = publish_records(publisher, topic_path, records)
+        stats["total_stop_events"] += published
+        stats["publishing_errors"] += errors
+
+        # Be polite to the BusData server.
+        time.sleep(0.1)
+
+    elapsed_time = time.perf_counter() - start_time
+
+    stats["publish_end_timestamp"] = datetime.now(timezone.utc)
+    stats["elapsed_time"] = elapsed_time
+    stats["throughput"] = (
+        stats["total_stop_events"] / elapsed_time
+        if elapsed_time > 0 else 0
+    )
+    stats["vehicles_with_data"] = len(vehicles_with_data)
+    stats["vehicles_without_data"] = len(vehicles_without_data)
+
+    return stats
+
+
+def print_statistics(stats):
+    """Print the publishing statistics of one run."""
+    print("\nStopEvent Publisher Statistics:")
+    print("-------------------------------")
+    print(f"RunID: {stats['run_id']}")
+    print(f"API Start Timestamp: {stats['api_start_timestamp']}")
+    print(f"Publishing End Timestamp: {stats['publish_end_timestamp']}")
+    print(f"Elapsed Wall-Clock Time: {stats['elapsed_time']:.2f} seconds")
+    print(f"Total StopEvents Published: {stats['total_stop_events']}")
+    print(f"Publishing Throughput: {stats['throughput']:.2f} StopEvents/second")
+    print(f"Unique Vehicles With Data: {stats['vehicles_with_data']}")
+    print(f"Unique Vehicles Without Data: {stats['vehicles_without_data']}")
+    print(f"API Errors: {stats['api_errors']}")
+    print(f"Parsing Errors: {stats['parsing_errors']}")
+    print(f"Publishing Errors: {stats['publishing_errors']}")
+
+
+def main():
+    """Publish the StopEvents of every vehicle in our group and print statistics."""
+    publisher = pubsub_v1.PublisherClient()
+    topic_path = publisher.topic_path(PROJECT_ID, TOPIC_ID)
+
+    with requests.Session() as session:
+        stats = run(session, publisher, topic_path, VEHICLE_IDS)
+
+    print_statistics(stats)
+
+
+if __name__ == "__main__":
+    main()
