@@ -8,6 +8,8 @@ Run from the Part-3 directory:
     python3 -m unittest discover -s tests -v
 """
 
+import contextlib
+import io
 import json
 import os
 import sys
@@ -57,6 +59,19 @@ def fake_response(status_code=200, text="<html></html>"):
     if status_code >= 400:
         response.raise_for_status.side_effect = requests.HTTPError(f"{status_code} error")
     return response
+
+
+def fake_api(responses):
+    """Return a fake session whose get() answers each vehicle_num from responses."""
+    session = mock.Mock()
+    session.get.side_effect = lambda url, params, timeout: responses[params["vehicle_num"]]
+    return session
+
+
+def stop_events_page(trip_id, row_count):
+    """Return a 200 response holding one trip with row_count valid StopEvents."""
+    rows = [("4001", "1010", str(i)) for i in range(row_count)]
+    return fake_response(text=page(trip_table(trip_id, rows)))
 
 
 class ParseStopEventsTests(unittest.TestCase):
@@ -233,6 +248,124 @@ class PublishRecordsTests(unittest.TestCase):
 
         self.assertEqual(result, (1, 1))
         self.assertEqual(self.publisher.publish.call_count, 2)
+
+
+class RunTests(unittest.TestCase):
+    """run() processes every vehicle and collects the run statistics."""
+
+    def setUp(self):
+        """Give each test a fake publisher and a sleep that returns immediately."""
+        # run() sleeps 0.1 s per vehicle to be polite to the real server.
+        sleep_patcher = mock.patch.object(se_publisher.time, "sleep")
+        sleep_patcher.start()
+        self.addCleanup(sleep_patcher.stop)
+
+        self.publisher = mock.Mock()
+
+    def run_vehicles(self, responses):
+        """Run the publisher over every vehicle in responses and return its stats."""
+        return se_publisher.run(
+            fake_api(responses), self.publisher, TOPIC_PATH, list(responses)
+        )
+
+    def test_api_error_is_counted_and_next_vehicle_is_published(self):
+        stats = self.run_vehicles({1: fake_response(500), 2: stop_events_page("111", 1)})
+
+        self.assertEqual(stats["api_errors"], 1)
+        self.assertEqual(stats["total_stop_events"], 1)
+
+    def test_bad_row_is_counted_and_good_rows_are_published(self):
+        rows = [("4001", "1010", "100"), ("4001", "1010"), ("4001", "1010", "300")]
+        stats = self.run_vehicles(
+            {1: fake_response(text=page(trip_table("111", rows)))}
+        )
+
+        self.assertEqual(stats["parsing_errors"], 1)
+        self.assertEqual(stats["total_stop_events"], 2)
+
+    def test_parser_crash_is_counted_and_next_vehicle_is_published(self):
+        crash_then_one_record = [RuntimeError("unexpected page"), ([{"trip_id": "111"}], 0)]
+        with mock.patch.object(
+            se_publisher, "parse_stop_events", side_effect=crash_then_one_record
+        ):
+            stats = self.run_vehicles(
+                {1: stop_events_page("111", 1), 2: stop_events_page("222", 1)}
+            )
+
+        self.assertEqual(stats["parsing_errors"], 1)
+        self.assertEqual(stats["total_stop_events"], 1)
+
+    def test_publishing_error_is_counted(self):
+        self.publisher.publish.side_effect = RuntimeError("client error")
+
+        stats = self.run_vehicles({1: stop_events_page("111", 1)})
+
+        self.assertEqual(stats["publishing_errors"], 1)
+        self.assertEqual(stats["total_stop_events"], 0)
+
+    def test_vehicles_with_and_without_data_are_counted(self):
+        stats = self.run_vehicles(
+            {
+                1: stop_events_page("111", 2),
+                2: fake_response(404, '{"error":"Not Found"}'),
+                3: fake_response(text=page("<h1>No stop events</h1>")),
+                4: fake_response(500),
+            }
+        )
+
+        self.assertEqual(stats["vehicles_with_data"], 1)
+        self.assertEqual(stats["vehicles_without_data"], 2)
+        self.assertEqual(stats["api_errors"], 1)
+
+    def test_throughput_is_stop_events_per_second(self):
+        with mock.patch.object(se_publisher.time, "perf_counter", side_effect=[100.0, 110.0]):
+            stats = self.run_vehicles({1: stop_events_page("111", 20)})
+
+        self.assertEqual(stats["elapsed_time"], 10.0)
+        self.assertEqual(stats["throughput"], 2.0)
+
+    def test_zero_elapsed_time_gives_zero_throughput(self):
+        with mock.patch.object(se_publisher.time, "perf_counter", side_effect=[5.0, 5.0]):
+            stats = self.run_vehicles({1: stop_events_page("111", 1)})
+
+        self.assertEqual(stats["throughput"], 0)
+
+
+class PrintStatisticsTests(unittest.TestCase):
+    """print_statistics() logs the numbers the spec asks for."""
+
+    def test_prints_counts_time_throughput_and_errors(self):
+        # Every count is different so a line printing the wrong field fails.
+        stats = {
+            "run_id": "test-run",
+            "api_start_timestamp": "start",
+            "publish_end_timestamp": "end",
+            "elapsed_time": 10.0,
+            "total_stop_events": 20,
+            "throughput": 2.0,
+            "vehicles_with_data": 3,
+            "vehicles_without_data": 7,
+            "api_errors": 4,
+            "parsing_errors": 5,
+            "publishing_errors": 6,
+        }
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            se_publisher.print_statistics(stats)
+
+        expected_lines = [
+            "Elapsed Wall-Clock Time: 10.00 seconds",
+            "Total StopEvents Published: 20",
+            "Publishing Throughput: 2.00 StopEvents/second",
+            "Unique Vehicles With Data: 3",
+            "Unique Vehicles Without Data: 7",
+            "API Errors: 4",
+            "Parsing Errors: 5",
+            "Publishing Errors: 6",
+        ]
+        for line in expected_lines:
+            with self.subTest(line=line):
+                self.assertIn(line, output.getvalue().splitlines())
 
 
 if __name__ == "__main__":
