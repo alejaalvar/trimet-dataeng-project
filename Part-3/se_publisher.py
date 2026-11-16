@@ -2,7 +2,7 @@ import json
 import re
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import requests
 from bs4 import BeautifulSoup
@@ -275,6 +275,41 @@ API_URL = "https://busdata.cs.pdx.edu/api/getStopEvents"
 # "Stop events for PDX_TRIP 242538843"; the trip ID appears nowhere else.
 TRIP_ID_PATTERN = re.compile(r"PDX_TRIP\s+(\d+)")
 
+# The service date appears only once, in the page's <h1> heading, e.g.
+# "Trimet CAD/AVL stop data for 2023-01-21".
+SERVICE_DATE_PATTERN = re.compile(r"\d{4}-\d{2}-\d{2}")
+
+# Columns holding seconds after midnight of the service date. The professor
+# asked for these to be published as full timestamps.
+TIME_COLUMNS = ("arrive_time", "stop_time", "leave_time")
+
+
+def find_service_date(soup):
+    """Return the service date from the page's <h1> heading, or None."""
+    heading = soup.find("h1")
+    if heading is None:
+        return None
+    match = SERVICE_DATE_PATTERN.search(heading.get_text())
+    if match is None:
+        return None
+    try:
+        return datetime.strptime(match.group(), "%Y-%m-%d")
+    except ValueError:
+        return None
+
+
+def to_timestamp(service_date, seconds):
+    """Return service_date + seconds as an ISO 8601 string, or None if seconds is not a whole number.
+
+    Trips running past midnight have times of 86,400 seconds or more; adding
+    them as a timedelta rolls those onto the next day, the same way Part-1
+    builds breadcrumb timestamps from OPD_DATE and ACT_TIME. No timezone is
+    attached, matching Part-1's local-time breadcrumb timestamps.
+    """
+    if seconds is None or not seconds.isdecimal():
+        return None
+    return (service_date + timedelta(seconds=int(seconds))).isoformat()
+
 
 def find_trip_id(table):
     """Return the trip ID from the <h2> heading directly before table, or None.
@@ -292,12 +327,15 @@ def find_trip_id(table):
 def parse_stop_events(html):
     """Extract StopEvent records from a getStopEvents HTML page.
 
-    Every record gets the trip ID of its table and loses the trip_number
-    column. Returns (records, bad_rows): a malformed row, or a row whose trip
-    is unknown, is skipped and counted rather than failing the whole page, so
-    one bad row does not discard the vehicle's good StopEvents.
+    Every record gets the trip ID of its table, loses the trip_number column,
+    and has its arrive/stop/leave times replaced by ISO 8601 timestamps.
+    Returns (records, bad_rows): a malformed row, or a row whose trip, date
+    or times cannot be determined, is skipped and counted rather than failing
+    the whole page, so one bad row does not discard the vehicle's good
+    StopEvents.
     """
     soup = BeautifulSoup(html, "html.parser")
+    service_date = find_service_date(soup)
 
     records = []
     bad_rows = 0
@@ -338,9 +376,10 @@ def parse_stop_events(html):
             if not cells:
                 continue
 
-            # A StopEvent without a trip ID cannot be joined to its trip
-            # downstream, so it is treated like a malformed row.
-            if trip_id is None or len(cells) != len(headers):
+            # A StopEvent without a trip ID or date cannot be joined to its
+            # trip or placed in time downstream, so it is treated like a
+            # malformed row.
+            if trip_id is None or service_date is None or len(cells) != len(headers):
                 bad_rows += 1
                 continue
 
@@ -350,6 +389,16 @@ def parse_stop_events(html):
             ]
 
             record = dict(zip(headers, values))
+
+            timestamps = {
+                column: to_timestamp(service_date, record.get(column))
+                for column in TIME_COLUMNS
+            }
+            if None in timestamps.values():
+                bad_rows += 1
+                continue
+
+            record.update(timestamps)
             # Dropped at the professor's request.
             record.pop("trip_number", None)
             record["trip_id"] = trip_id

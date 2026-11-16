@@ -25,9 +25,17 @@ import se_publisher  # noqa: E402
 
 FIXTURE_PATH = os.path.join(PART3_DIR, "tests", "fixtures", "stop_events_4001.html")
 
-# A small subset of the real columns, keeping trip_number so its removal can
-# be checked.
-HEADER_ROW = "<tr><th>vehicle_number</th><th>trip_number</th><th>leave_time</th></tr>"
+# A small subset of the real columns: trip_number so its removal can be
+# checked, and the three time columns that become timestamps.
+HEADER_ROW = (
+    "<tr><th>vehicle_number</th><th>trip_number</th>"
+    "<th>arrive_time</th><th>stop_time</th><th>leave_time</th></tr>"
+)
+
+
+def stop_row(seconds, vehicle="4001"):
+    """Return the cells of one StopEvent whose three times are all `seconds`."""
+    return (vehicle, "1010", seconds, seconds, seconds)
 
 
 def trip_table(trip_id, rows):
@@ -43,9 +51,13 @@ def trip_table(trip_id, rows):
     return f"{heading}<table>{HEADER_ROW}{body}</table>"
 
 
-def page(*parts):
-    """Wrap HTML fragments in a page body."""
-    return "<html><body>" + "".join(parts) + "</body></html>"
+def page(*parts, date="2023-01-21"):
+    """Wrap HTML fragments in a page with the real <h1> date heading.
+
+    date=None leaves out the heading.
+    """
+    heading = f"<h1>Trimet CAD/AVL stop data for {date}</h1>" if date else ""
+    return "<html><body>" + heading + "".join(parts) + "</body></html>"
 
 
 def fake_response(status_code=200, text="<html></html>"):
@@ -70,7 +82,7 @@ def fake_api(responses):
 
 def stop_events_page(trip_id, row_count):
     """Return a 200 response holding one trip with row_count valid StopEvents."""
-    rows = [("4001", "1010", str(i)) for i in range(row_count)]
+    rows = [stop_row(str(i)) for i in range(row_count)]
     return fake_response(text=page(trip_table(trip_id, rows)))
 
 
@@ -91,44 +103,73 @@ class ParseStopEventsTests(unittest.TestCase):
         self.assertEqual(self.sample_bad_rows, 0)
 
     def test_real_page_first_record_has_its_trip_and_values(self):
+        # Raw cells: arrive_time 24902, stop_time 24840, leave_time 24902.
         first = self.sample_records[0]
         self.assertEqual(first["trip_id"], "242538843")
         self.assertEqual(first["vehicle_number"], "4001")
-        self.assertEqual(first["leave_time"], "24902")
+        self.assertEqual(first["arrive_time"], "2023-01-21T06:55:02")
+        self.assertEqual(first["stop_time"], "2023-01-21T06:54:00")
+        self.assertEqual(first["leave_time"], "2023-01-21T06:55:02")
 
-    def test_record_has_trip_id_and_no_trip_number(self):
+    def test_record_has_trip_id_and_timestamps_and_no_trip_number(self):
         records, _ = se_publisher.parse_stop_events(
-            page(trip_table("111", [("4001", "1010", "100")]))
+            page(trip_table("111", [stop_row("3600")]))
         )
         self.assertEqual(
-            records, [{"vehicle_number": "4001", "leave_time": "100", "trip_id": "111"}]
+            records,
+            [
+                {
+                    "vehicle_number": "4001",
+                    "arrive_time": "2023-01-21T01:00:00",
+                    "stop_time": "2023-01-21T01:00:00",
+                    "leave_time": "2023-01-21T01:00:00",
+                    "trip_id": "111",
+                }
+            ],
         )
+
+    def test_each_time_column_gets_its_own_timestamp(self):
+        records, _ = se_publisher.parse_stop_events(
+            page(trip_table("111", [("4001", "1010", "3600", "3540", "3660")]))
+        )
+        self.assertEqual(records[0]["arrive_time"], "2023-01-21T01:00:00")
+        self.assertEqual(records[0]["stop_time"], "2023-01-21T00:59:00")
+        self.assertEqual(records[0]["leave_time"], "2023-01-21T01:01:00")
+
+    def test_time_past_midnight_rolls_over_to_the_next_day(self):
+        # 89,978 s is the last leave_time on the real page: 24:59:38.
+        records, _ = se_publisher.parse_stop_events(
+            page(trip_table("111", [stop_row("89978")]))
+        )
+        self.assertEqual(records[0]["leave_time"], "2023-01-22T00:59:38")
 
     def test_each_record_gets_its_own_tables_trip_id(self):
         records, _ = se_publisher.parse_stop_events(
             page(
-                trip_table("111", [("4001", "1010", "100")]),
-                trip_table("222", [("4001", "1020", "200")]),
+                trip_table("111", [stop_row("3600")]),
+                trip_table("222", [stop_row("7200")]),
             )
         )
         self.assertEqual([r["trip_id"] for r in records], ["111", "222"])
 
     def test_empty_cell_becomes_none(self):
         records, _ = se_publisher.parse_stop_events(
-            page(trip_table("111", [("4001", "1010", "")]))
+            page(trip_table("111", [stop_row("3600", vehicle="")]))
         )
-        self.assertIsNone(records[0]["leave_time"])
+        self.assertIsNone(records[0]["vehicle_number"])
 
     def test_row_with_wrong_cell_count_is_skipped_and_counted(self):
         records, bad_rows = se_publisher.parse_stop_events(
             page(
                 trip_table(
-                    "111",
-                    [("4001", "1010", "100"), ("4001", "1010"), ("4001", "1010", "300")],
+                    "111", [stop_row("3600"), ("4001", "1010"), stop_row("10800")]
                 )
             )
         )
-        self.assertEqual([r["leave_time"] for r in records], ["100", "300"])
+        self.assertEqual(
+            [r["leave_time"] for r in records],
+            ["2023-01-21T01:00:00", "2023-01-21T03:00:00"],
+        )
         self.assertEqual(bad_rows, 1)
 
     def test_table_without_trip_heading_is_skipped_and_counted(self):
@@ -136,17 +177,39 @@ class ParseStopEventsTests(unittest.TestCase):
         # that its rows are not credited to trip 111.
         records, bad_rows = se_publisher.parse_stop_events(
             page(
-                trip_table("111", [("4001", "1010", "100")]),
-                trip_table(None, [("4001", "1020", "200"), ("4001", "1020", "300")]),
+                trip_table("111", [stop_row("3600")]),
+                trip_table(None, [stop_row("7200"), stop_row("10800")]),
             )
         )
-        self.assertEqual([r["leave_time"] for r in records], ["100"])
+        self.assertEqual([r["trip_id"] for r in records], ["111"])
         self.assertEqual(bad_rows, 2)
 
-    def test_page_without_tables_has_no_records_or_errors(self):
-        self.assertEqual(
-            se_publisher.parse_stop_events(page("<h1>No stop events</h1>")), ([], 0)
+    def test_page_without_date_heading_has_every_row_skipped_and_counted(self):
+        records, bad_rows = se_publisher.parse_stop_events(
+            page(trip_table("111", [stop_row("3600"), stop_row("7200")]), date=None)
         )
+        self.assertEqual(records, [])
+        self.assertEqual(bad_rows, 2)
+
+    def test_row_with_missing_or_non_numeric_time_is_skipped_and_counted(self):
+        records, bad_rows = se_publisher.parse_stop_events(
+            page(
+                trip_table(
+                    "111",
+                    [
+                        stop_row("3600"),
+                        ("4001", "1010", "", "3600", "3600"),
+                        ("4001", "1010", "3600", "abc", "3600"),
+                        ("4001", "1010", "3600", "3600", "-5"),
+                    ],
+                )
+            )
+        )
+        self.assertEqual(len(records), 1)
+        self.assertEqual(bad_rows, 3)
+
+    def test_page_without_tables_has_no_records_or_errors(self):
+        self.assertEqual(se_publisher.parse_stop_events(page()), ([], 0))
 
 
 class FetchStopEventsTests(unittest.TestCase):
@@ -275,7 +338,7 @@ class RunTests(unittest.TestCase):
         self.assertEqual(stats["total_stop_events"], 1)
 
     def test_bad_row_is_counted_and_good_rows_are_published(self):
-        rows = [("4001", "1010", "100"), ("4001", "1010"), ("4001", "1010", "300")]
+        rows = [stop_row("3600"), ("4001", "1010"), stop_row("10800")]
         stats = self.run_vehicles(
             {1: fake_response(text=page(trip_table("111", rows)))}
         )
@@ -308,7 +371,7 @@ class RunTests(unittest.TestCase):
             {
                 1: stop_events_page("111", 2),
                 2: fake_response(404, '{"error":"Not Found"}'),
-                3: fake_response(text=page("<h1>No stop events</h1>")),
+                3: fake_response(text=page()),
                 4: fake_response(500),
             }
         )
