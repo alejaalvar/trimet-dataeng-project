@@ -11,6 +11,7 @@ Run from the Part-3 directory:
 import gzip
 import json
 import os
+import signal
 import sys
 import tempfile
 import unittest
@@ -401,6 +402,100 @@ class FinishIfIdleTests(BackupTestCase):
 
         self.assertEqual(self.read_archive(), [stop_event()])
         self.assertEqual(se_backup.stats["record_count"], 0)
+
+
+class ShutdownTests(BackupTestCase):
+    """Stopping main(), by Ctrl+C or systemd's SIGTERM, archives the current batch."""
+
+    def setUp(self):
+        """Replace Pub/Sub, signal registration, the checker thread and log setup with mocks."""
+        super().setUp()
+
+        # The pull's first result() call is interrupted, as a stop signal
+        # would; the second (waiting for running callbacks) returns.
+        client_patcher = mock.patch.object(se_backup.pubsub_v1, "SubscriberClient")
+        self.client = client_patcher.start().return_value
+        self.addCleanup(client_patcher.stop)
+        self.streaming_pull = self.client.subscribe.return_value
+        self.streaming_pull.result.side_effect = [KeyboardInterrupt, None]
+
+        # Registering real handlers would change how this test process
+        # itself responds to Ctrl+C and SIGTERM.
+        signal_patcher = mock.patch.object(se_backup.signal, "signal")
+        self.register_signal = signal_patcher.start()
+        self.addCleanup(signal_patcher.stop)
+
+        # A real checker thread would outlive the test and keep calling
+        # finish_if_idle() against later tests' state.
+        thread_patcher = mock.patch.object(se_backup, "Thread")
+        thread_patcher.start()
+        self.addCleanup(thread_patcher.stop)
+
+        # basicConfig would attach a handler to the root logger for every
+        # later test.
+        logging_patcher = mock.patch.object(se_backup.logging, "basicConfig")
+        logging_patcher.start()
+        self.addCleanup(logging_patcher.stop)
+
+        # main() sets stop_event on the way out; later tests need it cleared.
+        self.addCleanup(se_backup.stop_event.clear)
+
+    def run_main(self):
+        """Run main() until its simulated stop, capturing its logs."""
+        with self.assertLogs(level="INFO"):
+            se_backup.main()
+
+    def test_stop_signal_raises_keyboard_interrupt_and_ignores_repeats(self):
+        with self.assertRaises(KeyboardInterrupt):
+            se_backup.handle_stop_signal(signal.SIGTERM, None)
+
+        self.register_signal.assert_any_call(signal.SIGTERM, signal.SIG_IGN)
+        self.register_signal.assert_any_call(signal.SIGINT, signal.SIG_IGN)
+
+    def test_main_registers_the_handler_for_sigterm_and_ctrl_c(self):
+        self.run_main()
+
+        self.register_signal.assert_any_call(signal.SIGTERM, se_backup.handle_stop_signal)
+        self.register_signal.assert_any_call(signal.SIGINT, se_backup.handle_stop_signal)
+
+    def test_stopping_main_archives_the_current_batch(self):
+        records = [stop_event(trip="111"), stop_event(trip="222")]
+        self.receive(records)
+
+        self.run_main()
+
+        self.assertEqual(self.read_archive(), records)
+        self.assertEqual(se_backup.stats, se_backup.reset_stats())
+
+    def test_stop_during_reconnect_wait_still_waits_for_callbacks_and_archives(self):
+        # The connection drops, and the stop signal lands in the 5 s sleep
+        # before reconnecting, outside the try around result().
+        self.streaming_pull.result.side_effect = [RuntimeError("connection lost"), None]
+        self.receive([stop_event()])
+
+        with mock.patch.object(se_backup.time, "sleep", side_effect=KeyboardInterrupt):
+            self.run_main()
+
+        self.assertEqual(self.streaming_pull.result.call_count, 2)
+        self.client.close.assert_called_once()
+        self.assertEqual(self.read_archive(), [stop_event()])
+
+    def test_client_is_closed_only_after_running_callbacks_finish(self):
+        # Closing first would drop the acks of callbacks still running.
+        self.run_main()
+
+        # mock_calls records every call on the client and the objects it
+        # returned, in order, e.g. "subscribe().result" then "close".
+        call_names = [name for name, args, kwargs in self.client.mock_calls]
+        self.assertEqual(call_names[-2:], ["subscribe().result", "close"])
+
+    def test_failure_closing_the_client_still_archives_the_batch(self):
+        self.client.close.side_effect = RuntimeError("channel already closed")
+        self.receive([stop_event()])
+
+        self.run_main()
+
+        self.assertEqual(self.read_archive(), [stop_event()])
 
 
 if __name__ == "__main__":

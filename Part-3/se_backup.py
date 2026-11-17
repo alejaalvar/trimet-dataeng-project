@@ -4,6 +4,7 @@
 import json
 import gzip
 import os
+import signal
 import time
 import logging
 from datetime import datetime, timezone
@@ -285,12 +286,28 @@ def check_batch_completion():
             logging.exception('Error compressing StopEvent archive')
 
 
+def handle_stop_signal(signum, frame):
+    """Turn Ctrl+C or systemd's SIGTERM into one KeyboardInterrupt so the batch is archived.
+
+    The VM shuts down at the end of its daily window and systemd stops this
+    service with SIGTERM, whose Python default exits at once without the
+    final finish_batch(). Later stop signals are ignored so a second Ctrl+C
+    or SIGTERM cannot interrupt the shutdown itself and lose the batch.
+    """
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    raise KeyboardInterrupt
+
+
 def main():
     """Archive StopEvents from se_backup_sub until stopped, one daily file per batch."""
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s - %(levelname)s - %(message)s'
     )
+
+    signal.signal(signal.SIGTERM, handle_stop_signal)
+    signal.signal(signal.SIGINT, handle_stop_signal)
 
     os.makedirs(ARCHIVE_DIR, exist_ok=True)
 
@@ -316,44 +333,56 @@ def main():
         IDLE_SECONDS
     )
 
+    streaming_pull = None
+
     try:
-        with subscriber:
-            while not stop_event.is_set():
-                streaming_pull = subscriber.subscribe(
-                    sub_path,
-                    callback=callback,
-                    await_callbacks_on_shutdown=True
+        while not stop_event.is_set():
+            streaming_pull = subscriber.subscribe(
+                sub_path,
+                callback=callback,
+                await_callbacks_on_shutdown=True
+            )
+
+            try:
+                streaming_pull.result()
+
+            except Exception:
+                logging.exception(
+                    'Connection interrupted. Reconnecting...'
                 )
 
-                try:
-                    streaming_pull.result()
+                streaming_pull.cancel()
+                time.sleep(5)
 
-                except KeyboardInterrupt:
-                    logging.info('Stopping StopEvent backup subscriber...')
-                    stop_event.set()
-                    streaming_pull.cancel()
-
-                    # cancel() does not wait for running callbacks; with
-                    # await_callbacks_on_shutdown=True this result() does,
-                    # so no record is written after the final finish_batch()
-                    # and left unarchived.
-                    try:
-                        streaming_pull.result()
-                    except Exception:
-                        pass
-
-                    break
-
-                except Exception:
-                    logging.exception(
-                        'Connection interrupted. Reconnecting...'
-                    )
-
-                    streaming_pull.cancel()
-                    time.sleep(5)
+    # Caught here rather than around result() alone, because the stop signal
+    # can arrive anywhere in the loop, including the reconnect sleep.
+    # KeyboardInterrupt is not an Exception, so the handler above skips it.
+    except KeyboardInterrupt:
+        logging.info('Stopping StopEvent backup subscriber...')
 
     finally:
         stop_event.set()
+
+        # The stop can arrive anywhere above, e.g. during the reconnect
+        # sleep. cancel() does not wait for running callbacks; with
+        # await_callbacks_on_shutdown=True this result() does, so no record
+        # is written after the final finish_batch() and left unarchived.
+        # A failure here (e.g. the network already going down at VM
+        # shutdown) must not stop the batch from being archived below.
+        try:
+            if streaming_pull is not None:
+                streaming_pull.cancel()
+
+                try:
+                    streaming_pull.result()
+                except Exception:
+                    pass
+
+            # Closed only after running callbacks finish, so their acks are sent.
+            subscriber.close()
+
+        except Exception:
+            logging.exception('Error shutting down the Pub/Sub subscriber')
 
         # Archive whatever was received so a clean shutdown does not leave
         # the batch uncompressed.
