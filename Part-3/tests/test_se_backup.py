@@ -8,6 +8,7 @@ Run from the Part-3 directory:
     python3 -m unittest discover -s tests -v
 """
 
+import gzip
 import json
 import os
 import sys
@@ -73,6 +74,17 @@ class BackupTestCase(unittest.TestCase):
         path = os.path.join(self.archive_dir, f"se_{date}.jsonl")
         with open(path, encoding="utf-8") as file:
             return [json.loads(line) for line in file]
+
+    def receive(self, records):
+        """Deliver each record to callback() as a Pub/Sub message."""
+        for record in records:
+            se_backup.callback(message(record))
+
+    def read_archive(self, date="2026-11-17"):
+        """Return the parsed contents of the day's compressed archive."""
+        path = os.path.join(self.archive_dir, f"se_{date}.json.gz")
+        with gzip.open(path, "rt", encoding="utf-8") as file:
+            return json.load(file)
 
 
 class CallbackTests(BackupTestCase):
@@ -194,6 +206,84 @@ class CallbackTests(BackupTestCase):
         # A batch date kept from a failed write would send every later
         # record to this day's file.
         self.assertIsNone(se_backup.stats["date"])
+
+
+class CompressRecordsTests(BackupTestCase):
+    """compress_records() turns the day's working file into se_<date>.json.gz."""
+
+    def test_archive_is_a_json_array_of_every_received_record(self):
+        records = [stop_event(trip="111"), stop_event(trip="222"), stop_event(trip="333")]
+        self.receive(records)
+
+        se_backup.compress_records("2026-11-17")
+
+        self.assertEqual(self.read_archive(), records)
+
+    def test_single_record_archive_is_still_valid_json(self):
+        self.receive([stop_event()])
+
+        se_backup.compress_records("2026-11-17")
+
+        self.assertEqual(self.read_archive(), [stop_event()])
+
+    def test_returns_archive_size_and_finish_time(self):
+        self.receive([stop_event()])
+
+        compressed_bytes, finish_time = se_backup.compress_records("2026-11-17")
+
+        archive = os.path.join(self.archive_dir, "se_2026-11-17.json.gz")
+        self.assertEqual(compressed_bytes, os.path.getsize(archive))
+        self.assertEqual(finish_time, NOON)
+
+    def test_no_temporary_file_is_left_behind(self):
+        self.receive([stop_event()])
+
+        se_backup.compress_records("2026-11-17")
+
+        self.assertEqual(
+            sorted(os.listdir(self.archive_dir)),
+            ["se_2026-11-17.json.gz", "se_2026-11-17.jsonl"],
+        )
+
+    def test_failed_compression_keeps_the_previous_archive(self):
+        # Writing to a .tmp file and swapping it in is what protects the
+        # existing archive if compression dies part way through.
+        self.receive([stop_event(trip="111")])
+        se_backup.compress_records("2026-11-17")
+        self.receive([stop_event(trip="222")])
+
+        with mock.patch.object(se_backup.os, "replace", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                se_backup.compress_records("2026-11-17")
+
+        self.assertEqual(self.read_archive(), [stop_event(trip="111")])
+
+    def test_only_the_requested_days_records_are_archived(self):
+        self.receive([stop_event(trip="111")])
+        se_backup.stats = se_backup.reset_stats()
+        self.clock.now.return_value = datetime(2026, 11, 18, 12, 0, 0, tzinfo=timezone.utc)
+        self.receive([stop_event(trip="222")])
+
+        se_backup.compress_records("2026-11-17")
+
+        self.assertEqual(self.read_archive("2026-11-17"), [stop_event(trip="111")])
+        self.assertNotIn("se_2026-11-18.json.gz", os.listdir(self.archive_dir))
+
+    def test_missing_working_file_creates_no_archive(self):
+        self.assertEqual(se_backup.compress_records("2026-11-17"), (None, None))
+        self.assertEqual(os.listdir(self.archive_dir), [])
+
+    def test_second_batch_on_the_same_day_is_added_to_the_days_archive(self):
+        first_batch = [stop_event(trip="111"), stop_event(trip="222")]
+        second_batch = [stop_event(trip="333")]
+        self.receive(first_batch)
+        se_backup.compress_records("2026-11-17")
+        se_backup.stats = se_backup.reset_stats()
+
+        self.receive(second_batch)
+        se_backup.compress_records("2026-11-17")
+
+        self.assertEqual(self.read_archive(), first_batch + second_batch)
 
 
 if __name__ == "__main__":
