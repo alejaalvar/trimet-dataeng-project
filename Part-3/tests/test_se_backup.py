@@ -286,5 +286,122 @@ class CompressRecordsTests(BackupTestCase):
         self.assertEqual(self.read_archive(), first_batch + second_batch)
 
 
+class FinishBatchTests(BackupTestCase):
+    """finish_batch() archives the batch, logs its statistics and starts a new one."""
+
+    def finish_and_capture_logs(self):
+        """Run finish_batch() and return the messages it logged."""
+        with self.assertLogs(level="INFO") as logs:
+            se_backup.finish_batch()
+        return [record.getMessage() for record in logs.records]
+
+    def test_archives_the_batch_and_resets_stats(self):
+        records = [stop_event(trip="111"), stop_event(trip="222")]
+        self.receive(records)
+
+        self.finish_and_capture_logs()
+
+        self.assertEqual(self.read_archive(), records)
+        self.assertEqual(se_backup.stats, se_backup.reset_stats())
+
+    def test_does_nothing_without_records(self):
+        with self.assertNoLogs(level="INFO"):
+            se_backup.finish_batch()
+
+        self.assertEqual(os.listdir(self.archive_dir), [])
+
+    def test_logs_record_vehicle_byte_and_archive_statistics(self):
+        # Distinct clock readings for the two arrivals and the end of
+        # compression, so a line logging the wrong time is caught.
+        self.clock.now.side_effect = [
+            datetime(2026, 11, 17, 12, 0, 0, tzinfo=timezone.utc),
+            datetime(2026, 11, 17, 12, 5, 0, tzinfo=timezone.utc),
+            datetime(2026, 11, 17, 12, 10, 0, tzinfo=timezone.utc),
+        ]
+        self.receive([stop_event(vehicle="4001"), stop_event(vehicle="4002")])
+        working_file = os.path.join(self.archive_dir, "se_2026-11-17.jsonl")
+        bytes_received = os.path.getsize(working_file)
+
+        logged = self.finish_and_capture_logs()
+
+        archive = os.path.join(self.archive_dir, "se_2026-11-17.json.gz")
+        expected = [
+            "First record received: 2026-11-17T12:00:00+00:00",
+            "Last record received: 2026-11-17T12:05:00+00:00",
+            "Compression finished: 2026-11-17T12:10:00+00:00",
+            "Total StopEvent records: 2",
+            "Unique vehicles: 2",
+            f"Bytes before compression: {bytes_received}",
+            f"Compressed file size: {os.path.getsize(archive)} bytes",
+            "Archive file: se_2026-11-17.json.gz",
+        ]
+        for line in expected:
+            with self.subTest(line=line):
+                self.assertIn(line, logged)
+
+    def test_elapsed_time_is_receive_time_plus_compression_time(self):
+        # Messages arrive at 0 s and 8 s; compression runs from 100 s to 102 s.
+        # The idle wait in between is not part of the batch, as in backup.py.
+        with mock.patch.object(
+            se_backup.time, "monotonic", side_effect=[0.0, 8.0, 100.0, 102.0]
+        ):
+            self.receive([stop_event(trip="111"), stop_event(trip="222")])
+            logged = self.finish_and_capture_logs()
+
+        self.assertIn("Elapsed wall-clock time: 10.000 seconds", logged)
+        self.assertIn("Throughput: 0.20 records/second", logged)
+
+    def test_zero_elapsed_time_gives_zero_throughput(self):
+        # One record and an instant compression: elapsed is 0, which must
+        # not raise ZeroDivisionError.
+        with mock.patch.object(se_backup.time, "monotonic", return_value=5.0):
+            self.receive([stop_event()])
+            logged = self.finish_and_capture_logs()
+
+        self.assertIn("Throughput: 0.00 records/second", logged)
+
+    def test_missing_working_file_is_logged_and_the_batch_is_dropped(self):
+        self.receive([stop_event()])
+        os.remove(os.path.join(self.archive_dir, "se_2026-11-17.jsonl"))
+
+        with self.assertLogs(level="ERROR"):
+            se_backup.finish_batch()
+
+        self.assertEqual(se_backup.stats, se_backup.reset_stats())
+        self.assertEqual(os.listdir(self.archive_dir), [])
+
+
+class FinishIfIdleTests(BackupTestCase):
+    """finish_if_idle() ends the batch only after IDLE_SECONDS without a message."""
+
+    def receive_at(self, monotonic_seconds):
+        """Deliver one StopEvent as if it arrived at the given monotonic time."""
+        with mock.patch.object(se_backup.time, "monotonic", return_value=monotonic_seconds):
+            self.receive([stop_event()])
+
+    def check_idle_at(self, monotonic_seconds):
+        """Run finish_if_idle() as if the clock read the given monotonic time."""
+        with mock.patch.object(se_backup.time, "monotonic", return_value=monotonic_seconds):
+            se_backup.finish_if_idle()
+
+    def test_batch_is_not_finished_before_idle_seconds(self):
+        self.receive_at(0.0)
+
+        with self.assertNoLogs(level="INFO"):
+            self.check_idle_at(se_backup.IDLE_SECONDS - 1)
+
+        self.assertNotIn("se_2026-11-17.json.gz", os.listdir(self.archive_dir))
+        self.assertEqual(se_backup.stats["record_count"], 1)
+
+    def test_batch_is_finished_once_idle_seconds_have_passed(self):
+        self.receive_at(0.0)
+
+        with self.assertLogs(level="INFO"):
+            self.check_idle_at(se_backup.IDLE_SECONDS)
+
+        self.assertEqual(self.read_archive(), [stop_event()])
+        self.assertEqual(se_backup.stats["record_count"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()
