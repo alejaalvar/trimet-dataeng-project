@@ -309,7 +309,7 @@ def transform_record(record):
         elif column == 'service_key':
             value = record.get(column)
             transformed[column] = (
-                str(value) if value is not None else None
+                str(value) if value not in (None, '') else None
             )
 
         elif column in (
