@@ -63,11 +63,10 @@ def callback(message):
     try:
         with lock:
             # The whole batch goes into the file of the day its first record
-            # arrived, so a batch running past UTC midnight is not split.
-            if stats['date'] is None:
-                stats['date'] = received_at.strftime('%Y-%m-%d')
-
-            date = stats['date']
+            # arrived, so a batch running past UTC midnight is not split. The
+            # date is only kept once a write succeeds; otherwise a failed
+            # first write would pin every later batch to that day.
+            date = stats['date'] or received_at.strftime('%Y-%m-%d')
 
             # Records are kept as JSON Lines until the batch ends, then
             # compressed into the daily archive by compress_records().
@@ -82,6 +81,8 @@ def callback(message):
                 file.write(line)
                 file.flush()
                 os.fsync(file.fileno())
+
+            stats['date'] = date
 
             if stats['first_received'] is None:
                 stats['first_received'] = received_at
