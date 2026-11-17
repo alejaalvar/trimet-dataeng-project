@@ -230,7 +230,10 @@ def validate_record(record):
         except (ValueError, TypeError):
             fail(7, f'leave_time must be null or in [0, {MAX_SECONDS}]')
 
-    # A8: Coordinates must convert to valid GPS values
+    # A8: Coordinates must exist, be finite numbers and convert to GPS.
+    # pyproj signals a failed conversion by returning inf rather than
+    # raising, so the result is checked; it is always within +-90/+-180 when
+    # finite, so no range check is needed.
     try:
         x = optional_float(record.get('x_coordinate'))
         y = optional_float(record.get('y_coordinate'))
@@ -240,16 +243,11 @@ def validate_record(record):
 
         lat, lon = state_plane_to_latlon(x, y)
 
-        if not (
-            math.isfinite(lat)
-            and math.isfinite(lon)
-            and -90 <= lat <= 90
-            and -180 <= lon <= 180
-        ):
-            raise ValueError('Invalid GPS coordinates')
+        if not (math.isfinite(lat) and math.isfinite(lon)):
+            raise ValueError('Coordinates did not convert to GPS')
 
     except (ValueError, TypeError, OverflowError):
-        fail(8, 'Invalid State Plane coordinates')
+        fail(8, 'x_coordinate and y_coordinate must be finite numbers that convert to GPS')
 
     # A9: Passenger counts must be non-negative
     for field in ('ons', 'offs', 'estimated_load'):
