@@ -13,27 +13,16 @@ from google.cloud import pubsub_v1
 
 # Configuration
 PROJECT_ID = 'dataeng-project-511504'
-TOPIC_ID = 'se_topic'
 SUBSCRIPTION_ID = 'se_backup_sub'
 IDLE_SECONDS = 300
-
-# Initialize Pub/Sub subscriber
-subscriber = pubsub_v1.SubscriberClient()
-sub_path = subscriber.subscription_path(
-    PROJECT_ID, SUBSCRIPTION_ID
-)
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
+ARCHIVE_DIR = 'se_archives'
 
 lock = Lock()
 stop_event = Event()
 
 
-# Initialize daily statistics
 def reset_stats():
+    """Return empty statistics for a new batch."""
     return {
         'first_received': None,
         'last_received': None,
@@ -49,33 +38,39 @@ def reset_stats():
 stats = reset_stats()
 
 
-# Archive directory
-ARCHIVE_DIR = 'se_archives'
-os.makedirs(ARCHIVE_DIR, exist_ok=True)
-
-
-# Process incoming StopEvent messages
 def callback(message):
-    global stats
+    """Append one StopEvent to the batch's working file and update statistics.
 
+    A message that is not a JSON object is logged and acked, because
+    redelivering it can never succeed. Any other failure (e.g. a failed
+    write) is nacked so Pub/Sub delivers the message again.
+    """
     received_at = datetime.now(timezone.utc)
     received_mono = time.monotonic()
 
+    # UnicodeDecodeError and JSONDecodeError are both ValueErrors.
     try:
         record = json.loads(message.data.decode('utf-8'))
 
         if not isinstance(record, dict):
             raise ValueError('Expected JSON object')
 
+    except ValueError as error:
+        logging.warning('Invalid StopEvent message: %s', error)
+        message.ack()
+        return
+
+    try:
         with lock:
-            # Determine the date for the current batch
+            # The whole batch goes into the file of the day its first record
+            # arrived, so a batch running past UTC midnight is not split.
             if stats['date'] is None:
                 stats['date'] = received_at.strftime('%Y-%m-%d')
 
             date = stats['date']
 
-            # Write records to a temporary JSON Lines file
-            # before compressing at the end of the batch
+            # Records are kept as JSON Lines until the batch ends, then
+            # compressed into the daily archive by compress_records().
             filename = os.path.join(
                 ARCHIVE_DIR,
                 f'se_{date}.jsonl'
@@ -88,7 +83,6 @@ def callback(message):
                 file.flush()
                 os.fsync(file.fileno())
 
-            # Record first receive time
             if stats['first_received'] is None:
                 stats['first_received'] = received_at
                 stats['first_monotonic'] = received_mono
@@ -98,8 +92,7 @@ def callback(message):
 
             stats['record_count'] += 1
 
-            # Track unique vehicles
-            vehicle_id = record.get('VEHICLE_ID')
+            vehicle_id = record.get('vehicle_number')
 
             if vehicle_id is not None:
                 stats['vehicle_ids'].add(vehicle_id)
@@ -115,8 +108,13 @@ def callback(message):
         message.nack()
 
 
-# Compress daily StopEvent records
 def compress_records(date):
+    """Compress the day's JSON Lines file into se_<date>.json.gz as a JSON array.
+
+    The .jsonl file is kept, so a later batch on the same day is appended
+    to it and the archive is rebuilt with every record of the day. Returns
+    (compressed_bytes, finish_time), or (None, None) if there is no file.
+    """
     source_file = os.path.join(
         ARCHIVE_DIR,
         f'se_{date}.jsonl'
@@ -132,7 +130,6 @@ def compress_records(date):
     if not os.path.exists(source_file):
         return None, None
 
-    # Compress into a valid JSON array
     with open(source_file, 'r', encoding='utf-8') as source:
         with gzip.open(temp_file, 'wt', encoding='utf-8') as target:
             target.write('[\n')
@@ -151,7 +148,8 @@ def compress_records(date):
 
             target.write('\n]')
 
-    # Atomically replace the daily compressed archive
+    # Replacing in one step means a crash mid-compression never leaves a
+    # truncated archive in place of the previous one.
     os.replace(temp_file, output_file)
 
     compressed_bytes = os.path.getsize(output_file)
@@ -160,17 +158,9 @@ def compress_records(date):
     return compressed_bytes, finish_time
 
 
-# Log completed batch statistics
-def log_statistics(compressed_bytes, finish_time):
+def log_statistics(compressed_bytes, finish_time, elapsed):
+    """Log the statistics of a finished batch."""
     count = stats['record_count']
-
-    if count == 0:
-        return
-
-    elapsed = (
-        stats['last_monotonic']
-        - stats['first_monotonic']
-    )
 
     throughput = count / elapsed if elapsed > 0 else 0
 
@@ -209,7 +199,7 @@ def log_statistics(compressed_bytes, finish_time):
     )
 
     logging.info(
-        'Elapsed receive time: %.3f seconds',
+        'Elapsed wall-clock time: %.3f seconds',
         elapsed
     )
 
@@ -226,98 +216,152 @@ def log_statistics(compressed_bytes, finish_time):
     logging.info('===============================================')
 
 
-# Check for batch completion after inactivity
-def check_batch_completion():
+def finish_batch_locked():
+    """Compress the current batch into its daily archive, log statistics and start a new batch.
+
+    The caller must hold `lock`. Does nothing if no records were received.
+    """
     global stats
 
+    if stats['record_count'] == 0:
+        return
+
+    compress_start = time.monotonic()
+    compressed_bytes, finish_time = compress_records(stats['date'])
+    compress_seconds = time.monotonic() - compress_start
+
+    # Without its working file the batch can never be archived; starting
+    # over avoids retrying (and failing) every few seconds forever.
+    if compressed_bytes is None:
+        logging.error(
+            'Working file for se_%s is missing; batch of %d records not archived',
+            stats['date'], stats['record_count']
+        )
+        stats = reset_stats()
+        return
+
+    # The batch is only known to be over after IDLE_SECONDS of silence, so
+    # that wait is excluded, as in backup.py: elapsed = receive time +
+    # compression time.
+    receive_seconds = stats['last_monotonic'] - stats['first_monotonic']
+    log_statistics(compressed_bytes, finish_time, receive_seconds + compress_seconds)
+
+    stats = reset_stats()
+
+
+def finish_batch():
+    """Finish the current batch now (see finish_batch_locked)."""
+    with lock:
+        finish_batch_locked()
+
+
+def finish_if_idle():
+    """Finish the batch once no message has arrived for IDLE_SECONDS.
+
+    Pub/Sub has no end-of-batch signal, so a long silence is taken to mean
+    the publisher is done for the day. The check and the finish happen under
+    one hold of the lock so a message arriving in between cannot be added to
+    the batch being closed.
+    """
+    with lock:
+        if stats['record_count'] == 0:
+            return
+
+        idle_time = time.monotonic() - stats['last_monotonic']
+
+        if idle_time >= IDLE_SECONDS:
+            logging.info('StopEvent batch idle for %.0f seconds.', idle_time)
+            finish_batch_locked()
+
+
+def check_batch_completion():
+    """Check every 5 seconds whether the batch has gone idle, until shutdown."""
     while not stop_event.wait(5):
-        with lock:
-            if stats['record_count'] == 0:
-                continue
+        try:
+            finish_if_idle()
 
-            idle_time = (
-                time.monotonic()
-                - stats['last_monotonic']
-            )
+        except Exception:
+            logging.exception('Error compressing StopEvent archive')
 
-            if idle_time >= IDLE_SECONDS:
-                date = stats['date']
+
+def main():
+    """Archive StopEvents from se_backup_sub until stopped, one daily file per batch."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s'
+    )
+
+    os.makedirs(ARCHIVE_DIR, exist_ok=True)
+
+    subscriber = pubsub_v1.SubscriberClient()
+    sub_path = subscriber.subscription_path(
+        PROJECT_ID, SUBSCRIPTION_ID
+    )
+
+    checker = Thread(
+        target=check_batch_completion,
+        daemon=True
+    )
+
+    checker.start()
+
+    logging.info(
+        'StopEvent backup subscriber listening on %s',
+        sub_path
+    )
+
+    logging.info(
+        'Batch inactivity threshold: %d seconds',
+        IDLE_SECONDS
+    )
+
+    try:
+        with subscriber:
+            while not stop_event.is_set():
+                streaming_pull = subscriber.subscribe(
+                    sub_path,
+                    callback=callback,
+                    await_callbacks_on_shutdown=True
+                )
 
                 try:
-                    compressed_bytes, finish_time = compress_records(date)
+                    streaming_pull.result()
 
-                    if compressed_bytes is not None:
-                        log_statistics(compressed_bytes, finish_time)
+                except KeyboardInterrupt:
+                    logging.info('Stopping StopEvent backup subscriber...')
+                    stop_event.set()
+                    streaming_pull.cancel()
 
-                        logging.info(
-                            'StopEvent backup complete after %.0f seconds idle.',
-                            idle_time
-                        )
+                    # cancel() does not wait for running callbacks; with
+                    # await_callbacks_on_shutdown=True this result() does,
+                    # so no record is written after the final finish_batch()
+                    # and left unarchived.
+                    try:
+                        streaming_pull.result()
+                    except Exception:
+                        pass
 
-                        stats = reset_stats()
+                    break
 
                 except Exception:
-                    logging.exception('Error compressing StopEvent archive')
+                    logging.exception(
+                        'Connection interrupted. Reconnecting...'
+                    )
+
+                    streaming_pull.cancel()
+                    time.sleep(5)
+
+    finally:
+        stop_event.set()
+
+        # Archive whatever was received so a clean shutdown does not leave
+        # the batch uncompressed.
+        try:
+            finish_batch()
+
+        except Exception:
+            logging.exception('Failed to finalize StopEvent backup')
 
 
-# Start background inactivity checker
-checker = Thread(
-    target=check_batch_completion,
-    daemon=True
-)
-
-checker.start()
-
-logging.info(
-    'StopEvent backup subscriber listening on %s',
-    sub_path
-)
-
-logging.info(
-    'Batch inactivity threshold: %d seconds',
-    IDLE_SECONDS
-)
-
-
-# Long-running subscriber
-try:
-    with subscriber:
-        while not stop_event.is_set():
-            streaming_pull = subscriber.subscribe(
-                sub_path,
-                callback=callback
-            )
-
-            try:
-                streaming_pull.result()
-
-            except KeyboardInterrupt:
-                logging.info('Stopping StopEvent backup subscriber...')
-                stop_event.set()
-                streaming_pull.cancel()
-                break
-
-            except Exception:
-                logging.exception(
-                    'Connection interrupted. Reconnecting...'
-                )
-
-                streaming_pull.cancel()
-                time.sleep(5)
-
-finally:
-    stop_event.set()
-
-    # Compress remaining records during a clean shutdown
-    with lock:
-        if stats['record_count'] > 0:
-            try:
-                compressed_bytes, finish_time = compress_records(
-                    stats['date']
-                )
-
-                if compressed_bytes is not None:
-                    log_statistics(compressed_bytes, finish_time)
-
-            except Exception:
-                logging.exception('Failed to finalize StopEvent backup')
+if __name__ == '__main__':
+    main()
