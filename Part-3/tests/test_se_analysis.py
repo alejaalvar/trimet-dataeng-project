@@ -11,6 +11,7 @@ Run from the Part-3 directory:
 import os
 import sys
 import unittest
+from datetime import datetime
 from unittest import mock
 
 PART3_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -169,6 +170,94 @@ class ValidateRecordTests(unittest.TestCase):
     def test_a10_dwell_must_be_null_or_non_negative(self):
         self.assert_only_violates("A10", dwell="-5")
         self.assertEqual(failed_assertions(valid_record(dwell=None)), set())
+
+
+class TransformRecordTests(unittest.TestCase):
+    """transform_record() applies Transformations 1 and 2 from spec section 6.2."""
+
+    def test_times_become_datetimes_on_the_service_date(self):
+        row = se_analysis.transform_record(valid_record())
+
+        self.assertEqual(row["arrive_time"], datetime(2023, 1, 21, 6, 55, 2))
+        self.assertEqual(row["stop_time"], datetime(2023, 1, 21, 6, 54, 0))
+        self.assertEqual(row["leave_time"], datetime(2023, 1, 21, 6, 55, 2))
+
+    def test_times_use_the_records_own_service_date(self):
+        row = se_analysis.transform_record(valid_record(service_date="2024-03-05"))
+
+        self.assertEqual(row["arrive_time"], datetime(2024, 3, 5, 6, 55, 2))
+
+    def test_time_past_midnight_rolls_over_to_the_next_day(self):
+        # 89,978 s (24:59:38) is the last leave_time on the real page; on
+        # New Year's Eve the rollover also changes the month and year.
+        row = se_analysis.transform_record(
+            valid_record(
+                service_date="2023-12-31",
+                arrive_time="89978",
+                stop_time="89978",
+                leave_time="89978",
+            )
+        )
+
+        for column in ("arrive_time", "stop_time", "leave_time"):
+            with self.subTest(column=column):
+                self.assertEqual(row[column], datetime(2024, 1, 1, 0, 59, 38))
+
+    def test_missing_stop_and_leave_times_become_none(self):
+        row = se_analysis.transform_record(valid_record(stop_time=None, leave_time=""))
+
+        self.assertIsNone(row["stop_time"])
+        self.assertIsNone(row["leave_time"])
+
+    def test_state_plane_coordinates_become_gps(self):
+        # The professor's example point, "expected output near lat=45.494,
+        # lon=-122.591". His scaffold gives 45.505 with pyproj 3.8, so "near"
+        # is checked with a tolerance; a swapped axis or wrong projection is
+        # off by degrees.
+        row = se_analysis.transform_record(
+            valid_record(x_coordinate="7666298.96", y_coordinate="677239.73")
+        )
+
+        self.assertAlmostEqual(row["gps_latitude"], 45.494, delta=0.02)
+        self.assertAlmostEqual(row["gps_longitude"], -122.591, delta=0.02)
+
+    def test_real_stop_converts_back_to_its_original_gps(self):
+        # The page's x/y for this stop convert to 45.4908600018, -122.8015400000:
+        # TriMet evidently derived x/y from these 5-decimal GPS values, which
+        # makes them an independent check of the projection.
+        row = se_analysis.transform_record(valid_record())
+
+        self.assertAlmostEqual(row["gps_latitude"], 45.49086, delta=1e-6)
+        self.assertAlmostEqual(row["gps_longitude"], -122.80154, delta=1e-6)
+
+    def test_result_has_exactly_the_table_columns(self):
+        # x/y are replaced by GPS and service_date only feeds the timestamps,
+        # so none of them may reach the INSERT.
+        row = se_analysis.transform_record(valid_record())
+
+        self.assertEqual(set(row), set(se_analysis.DB_COLUMNS))
+
+    def test_fields_become_the_column_types(self):
+        row = se_analysis.transform_record(valid_record())
+
+        # assertIs on the type, because 4001 == 4001.0 would hide a column
+        # parsed as the wrong type.
+        self.assertEqual(row["vehicle_number"], 4001)
+        self.assertIs(type(row["vehicle_number"]), int)
+        self.assertEqual(row["trip_number"], 242538843)
+        self.assertIs(type(row["trip_number"]), int)
+        self.assertEqual(row["train_mileage"], 3.1)
+        self.assertIs(type(row["train_mileage"]), float)
+        self.assertEqual(row["service_key"], "S")
+
+    def test_empty_optional_fields_become_none(self):
+        row = se_analysis.transform_record(
+            valid_record(route_number="", train_mileage=None, service_key="")
+        )
+
+        self.assertIsNone(row["route_number"])
+        self.assertIsNone(row["train_mileage"])
+        self.assertIsNone(row["service_key"])
 
 
 if __name__ == "__main__":
