@@ -25,8 +25,8 @@ import se_publisher  # noqa: E402
 
 FIXTURE_PATH = os.path.join(PART3_DIR, "tests", "fixtures", "stop_events_4001.html")
 
-# A small subset of the real columns: trip_number so its removal can be
-# checked, and the three time columns that become timestamps.
+# A small subset of the real columns: trip_number, so its replacement by the
+# trip ID can be checked, and the three time columns.
 HEADER_ROW = (
     "<tr><th>vehicle_number</th><th>trip_number</th>"
     "<th>arrive_time</th><th>stop_time</th><th>leave_time</th></tr>"
@@ -102,16 +102,16 @@ class ParseStopEventsTests(unittest.TestCase):
         self.assertEqual(len(self.sample_records), 1039)
         self.assertEqual(self.sample_bad_rows, 0)
 
-    def test_real_page_first_record_has_its_trip_and_values(self):
-        # Raw cells: arrive_time 24902, stop_time 24840, leave_time 24902.
+    def test_real_page_first_record_has_its_trip_date_and_values(self):
         first = self.sample_records[0]
-        self.assertEqual(first["trip_id"], "242538843")
+        self.assertEqual(first["trip_number"], "242538843")
+        self.assertEqual(first["service_date"], "2023-01-21")
         self.assertEqual(first["vehicle_number"], "4001")
-        self.assertEqual(first["arrive_time"], "2023-01-21T06:55:02")
-        self.assertEqual(first["stop_time"], "2023-01-21T06:54:00")
-        self.assertEqual(first["leave_time"], "2023-01-21T06:55:02")
+        self.assertEqual(first["arrive_time"], "24902")
+        self.assertEqual(first["stop_time"], "24840")
+        self.assertEqual(first["leave_time"], "24902")
 
-    def test_record_has_trip_id_and_timestamps_and_no_trip_number(self):
+    def test_record_has_trip_id_as_trip_number_and_the_service_date(self):
         records, _ = se_publisher.parse_stop_events(
             page(trip_table("111", [stop_row("3600")]))
         )
@@ -120,28 +120,14 @@ class ParseStopEventsTests(unittest.TestCase):
             [
                 {
                     "vehicle_number": "4001",
-                    "arrive_time": "2023-01-21T01:00:00",
-                    "stop_time": "2023-01-21T01:00:00",
-                    "leave_time": "2023-01-21T01:00:00",
-                    "trip_id": "111",
+                    "trip_number": "111",
+                    "arrive_time": "3600",
+                    "stop_time": "3600",
+                    "leave_time": "3600",
+                    "service_date": "2023-01-21",
                 }
             ],
         )
-
-    def test_each_time_column_gets_its_own_timestamp(self):
-        records, _ = se_publisher.parse_stop_events(
-            page(trip_table("111", [("4001", "1010", "3600", "3540", "3660")]))
-        )
-        self.assertEqual(records[0]["arrive_time"], "2023-01-21T01:00:00")
-        self.assertEqual(records[0]["stop_time"], "2023-01-21T00:59:00")
-        self.assertEqual(records[0]["leave_time"], "2023-01-21T01:01:00")
-
-    def test_time_past_midnight_rolls_over_to_the_next_day(self):
-        # 89,978 s is the last leave_time on the real page: 24:59:38.
-        records, _ = se_publisher.parse_stop_events(
-            page(trip_table("111", [stop_row("89978")]))
-        )
-        self.assertEqual(records[0]["leave_time"], "2023-01-22T00:59:38")
 
     def test_each_record_gets_its_own_tables_trip_id(self):
         records, _ = se_publisher.parse_stop_events(
@@ -150,7 +136,19 @@ class ParseStopEventsTests(unittest.TestCase):
                 trip_table("222", [stop_row("7200")]),
             )
         )
-        self.assertEqual([r["trip_id"] for r in records], ["111", "222"])
+        self.assertEqual([r["trip_number"] for r in records], ["111", "222"])
+
+    def test_time_values_are_published_unchanged(self):
+        # Invalid times are se_analysis.py's to reject (validations 1, 6, 7),
+        # so the publisher must pass them through rather than drop the row.
+        records, bad_rows = se_publisher.parse_stop_events(
+            page(trip_table("111", [("4001", "1010", "", "abc", "-5")]))
+        )
+        self.assertEqual(
+            (records[0]["arrive_time"], records[0]["stop_time"], records[0]["leave_time"]),
+            (None, "abc", "-5"),
+        )
+        self.assertEqual(bad_rows, 0)
 
     def test_empty_cell_becomes_none(self):
         records, _ = se_publisher.parse_stop_events(
@@ -166,10 +164,7 @@ class ParseStopEventsTests(unittest.TestCase):
                 )
             )
         )
-        self.assertEqual(
-            [r["leave_time"] for r in records],
-            ["2023-01-21T01:00:00", "2023-01-21T03:00:00"],
-        )
+        self.assertEqual([r["leave_time"] for r in records], ["3600", "10800"])
         self.assertEqual(bad_rows, 1)
 
     def test_table_without_trip_heading_is_skipped_and_counted(self):
@@ -181,8 +176,14 @@ class ParseStopEventsTests(unittest.TestCase):
                 trip_table(None, [stop_row("7200"), stop_row("10800")]),
             )
         )
-        self.assertEqual([r["trip_id"] for r in records], ["111"])
+        self.assertEqual([r["trip_number"] for r in records], ["111"])
         self.assertEqual(bad_rows, 2)
+
+    def test_service_date_comes_from_the_pages_heading(self):
+        records, _ = se_publisher.parse_stop_events(
+            page(trip_table("111", [stop_row("3600")]), date="2024-03-05")
+        )
+        self.assertEqual(records[0]["service_date"], "2024-03-05")
 
     def test_page_without_date_heading_has_every_row_skipped_and_counted(self):
         records, bad_rows = se_publisher.parse_stop_events(
@@ -191,22 +192,12 @@ class ParseStopEventsTests(unittest.TestCase):
         self.assertEqual(records, [])
         self.assertEqual(bad_rows, 2)
 
-    def test_row_with_missing_or_non_numeric_time_is_skipped_and_counted(self):
+    def test_page_with_an_impossible_date_has_every_row_skipped_and_counted(self):
         records, bad_rows = se_publisher.parse_stop_events(
-            page(
-                trip_table(
-                    "111",
-                    [
-                        stop_row("3600"),
-                        ("4001", "1010", "", "3600", "3600"),
-                        ("4001", "1010", "3600", "abc", "3600"),
-                        ("4001", "1010", "3600", "3600", "-5"),
-                    ],
-                )
-            )
+            page(trip_table("111", [stop_row("3600")]), date="2023-02-30")
         )
-        self.assertEqual(len(records), 1)
-        self.assertEqual(bad_rows, 3)
+        self.assertEqual(records, [])
+        self.assertEqual(bad_rows, 1)
 
     def test_page_without_tables_has_no_records_or_errors(self):
         self.assertEqual(se_publisher.parse_stop_events(page()), ([], 0))
@@ -281,8 +272,8 @@ class PublishRecordsTests(unittest.TestCase):
         """
         self.publisher = mock.Mock()
         self.records = [
-            {"trip_id": "111", "leave_time": "100"},
-            {"trip_id": "111", "leave_time": "200"},
+            {"trip_number": "111", "leave_time": "100"},
+            {"trip_number": "111", "leave_time": "200"},
         ]
 
     def test_each_record_is_published_as_its_own_json_message(self):
@@ -347,7 +338,7 @@ class RunTests(unittest.TestCase):
         self.assertEqual(stats["total_stop_events"], 2)
 
     def test_parser_crash_is_counted_and_next_vehicle_is_published(self):
-        crash_then_one_record = [RuntimeError("unexpected page"), ([{"trip_id": "111"}], 0)]
+        crash_then_one_record = [RuntimeError("unexpected page"), ([{"trip_number": "111"}], 0)]
         with mock.patch.object(
             se_publisher, "parse_stop_events", side_effect=crash_then_one_record
         ):

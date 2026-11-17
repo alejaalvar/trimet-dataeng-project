@@ -29,11 +29,12 @@ NOON = datetime(2026, 11, 17, 12, 0, 0, tzinfo=timezone.utc)
 def stop_event(vehicle="4001", trip="111"):
     """Return a StopEvent record shaped like the ones se_publisher.py sends."""
     return {
-        "trip_id": trip,
+        "trip_number": trip,
         "vehicle_number": vehicle,
-        "arrive_time": "2023-01-21T06:55:02",
-        "stop_time": "2023-01-21T06:54:00",
-        "leave_time": "2023-01-21T06:55:02",
+        "service_date": "2023-01-21",
+        "arrive_time": "24902",
+        "stop_time": "24840",
+        "leave_time": "24902",
     }
 
 
@@ -105,7 +106,7 @@ class CallbackTests(BackupTestCase):
         se_backup.callback(message(stop_event(trip="222")))
 
         self.assertEqual(
-            [record["trip_id"] for record in self.archived_lines()], ["111", "222"]
+            [record["trip_number"] for record in self.archived_lines()], ["111", "222"]
         )
         self.assertEqual(se_backup.stats["record_count"], 2)
 
@@ -189,7 +190,7 @@ class CallbackTests(BackupTestCase):
         se_backup.callback(message(stop_event(trip="222")))
 
         self.assertEqual(
-            [record["trip_id"] for record in self.archived_lines("2026-11-17")],
+            [record["trip_number"] for record in self.archived_lines("2026-11-17")],
             ["111", "222"],
         )
         self.assertEqual(os.listdir(self.archive_dir), ["se_2026-11-17.jsonl"])
