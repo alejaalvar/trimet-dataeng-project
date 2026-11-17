@@ -11,6 +11,7 @@ Run from the Part-3 directory:
 import glob
 import json
 import os
+import signal
 import sys
 import tempfile
 import unittest
@@ -345,6 +346,10 @@ class AnalysisTestCase(unittest.TestCase):
                 entries.extend(json.loads(line) for line in file)
         return entries
 
+    def messages(self, logs):
+        """Return the formatted messages captured by an assertLogs block."""
+        return [record.getMessage() for record in logs.records]
+
     def inserted_value(self, column, insert=0):
         """Return the value sent for `column` in the given INSERT."""
         _, values = self.db.inserts[insert]
@@ -514,6 +519,244 @@ class CallbackTests(AnalysisTestCase):
         self.assertEqual(se_analysis.stats["vehicle_ids"], {"4001", "4002"})
         self.assertEqual(se_analysis.stats["trip_ids"], {"111", "222"})
         self.assertEqual(se_analysis.stats["received_count"], 2)
+
+
+class StatisticsTests(AnalysisTestCase):
+    """The batch statistics spec section 8 asks for, logged when a batch ends."""
+
+    def finish_and_capture_logs(self):
+        """Run finish_batch() and return the messages it logged."""
+        with self.assertLogs(level="INFO") as logs:
+            se_analysis.finish_batch()
+        return self.messages(logs)
+
+    def test_logs_counts_vehicles_trips_and_throughput(self):
+        # Messages arrive at 0, 4, 8 and 12 s: two stored, one duplicate and
+        # one invalid, from three vehicles on three trips.
+        with mock.patch.object(se_analysis.time, "monotonic", side_effect=[0.0, 4.0, 8.0, 12.0]):
+            self.send(valid_record(vehicle_number="4001", trip_number="111"))
+            self.send(valid_record(vehicle_number="4002", trip_number="222"))
+            self.db.rowcount = 0
+            self.send(valid_record(vehicle_number="4001", trip_number="111"))
+            with self.assertLogs(level="WARNING"):
+                self.send(valid_record(vehicle_number="4003", trip_number="333", arrive_time="abc"))
+
+        logged = self.finish_and_capture_logs()
+
+        expected = [
+            "Total messages: 4",
+            "Inserted records: 2",
+            "Duplicate records skipped: 1",
+            "Invalid records: 1",
+            "Unique vehicles: 3",
+            "Unique trips: 3",
+            "Elapsed receive time: 12.000 seconds",
+            "Throughput: 0.33 messages/second",
+        ]
+        for line in expected:
+            with self.subTest(line=line):
+                self.assertIn(line, logged)
+
+    def test_logs_first_and_last_receive_times(self):
+        first = datetime(2026, 11, 17, 9, 10, 0)
+        last = datetime(2026, 11, 17, 9, 40, 0)
+        se_analysis.record_receive(first, 0.0, valid_record())
+        se_analysis.record_receive(last, 1800.0, valid_record())
+
+        logged = self.finish_and_capture_logs()
+
+        self.assertIn("First message received: 2026-11-17T09:10:00", logged)
+        self.assertIn("Last message received: 2026-11-17T09:40:00", logged)
+
+    def test_single_message_gives_zero_throughput(self):
+        # One message means zero elapsed time, which must not divide by zero.
+        self.send(valid_record())
+
+        logged = self.finish_and_capture_logs()
+
+        self.assertIn("Throughput: 0.00 messages/second", logged)
+
+    def test_finishing_resets_the_statistics(self):
+        self.send(valid_record())
+
+        self.finish_and_capture_logs()
+
+        self.assertEqual(se_analysis.stats, se_analysis.reset_stats())
+
+    def test_finishing_without_messages_logs_nothing(self):
+        with self.assertNoLogs(level="INFO"):
+            se_analysis.finish_batch()
+
+
+class FinishIfIdleTests(AnalysisTestCase):
+    """finish_if_idle() ends the batch only after IDLE_SECONDS without a message."""
+
+    def receive_at(self, monotonic_seconds):
+        """Deliver one valid StopEvent as if it arrived at the given monotonic time."""
+        with mock.patch.object(se_analysis.time, "monotonic", return_value=monotonic_seconds):
+            self.send(valid_record())
+
+    def check_idle_at(self, monotonic_seconds):
+        """Run finish_if_idle() as if the clock read the given monotonic time."""
+        with mock.patch.object(se_analysis.time, "monotonic", return_value=monotonic_seconds):
+            se_analysis.finish_if_idle()
+
+    def test_batch_is_not_finished_before_idle_seconds(self):
+        self.receive_at(0.0)
+
+        with self.assertNoLogs(level="INFO"):
+            self.check_idle_at(se_analysis.IDLE_SECONDS - 1)
+
+        self.assertEqual(se_analysis.stats["received_count"], 1)
+
+    def test_batch_is_finished_once_idle_seconds_have_passed(self):
+        self.receive_at(0.0)
+
+        with self.assertLogs(level="INFO") as logs:
+            self.check_idle_at(se_analysis.IDLE_SECONDS)
+
+        self.assertIn("Total messages: 1", self.messages(logs))
+        self.assertEqual(se_analysis.stats["received_count"], 0)
+
+    def test_idle_check_without_messages_does_nothing(self):
+        with self.assertNoLogs(level="INFO"):
+            self.check_idle_at(se_analysis.IDLE_SECONDS * 10)
+
+
+class ShutdownTests(AnalysisTestCase):
+    """Stopping main(), by Ctrl+C or systemd's SIGTERM, logs the batch and closes the database."""
+
+    def setUp(self):
+        """Replace Pub/Sub, signal registration, the checker thread and log setup with mocks."""
+        super().setUp()
+
+        # The pull's first result() call is interrupted, as a stop signal
+        # would; the second (waiting for running callbacks) returns.
+        client_patcher = mock.patch.object(se_analysis.pubsub_v1, "SubscriberClient")
+        self.client_class = client_patcher.start()
+        self.addCleanup(client_patcher.stop)
+        self.client = self.client_class.return_value
+        self.streaming_pull = self.client.subscribe.return_value
+        self.streaming_pull.result.side_effect = [KeyboardInterrupt, None]
+
+        # Registering real handlers would change how this test process
+        # itself responds to Ctrl+C and SIGTERM.
+        signal_patcher = mock.patch.object(se_analysis.signal, "signal")
+        self.register_signal = signal_patcher.start()
+        self.addCleanup(signal_patcher.stop)
+
+        # A real checker thread would outlive the test and keep calling
+        # finish_if_idle() against later tests' state.
+        thread_patcher = mock.patch.object(se_analysis, "Thread")
+        thread_patcher.start()
+        self.addCleanup(thread_patcher.stop)
+
+        # basicConfig would attach a handler to the root logger for every
+        # later test.
+        logging_patcher = mock.patch.object(se_analysis.logging, "basicConfig")
+        logging_patcher.start()
+        self.addCleanup(logging_patcher.stop)
+
+        # main() sets stop_event on the way out; later tests need it cleared.
+        self.addCleanup(se_analysis.stop_event.clear)
+
+    def run_main(self):
+        """Run main() until its simulated stop and return the messages it logged."""
+        with self.assertLogs(level="INFO") as logs:
+            se_analysis.main()
+        return self.messages(logs)
+
+    def test_stop_signal_raises_keyboard_interrupt_and_ignores_repeats(self):
+        with self.assertRaises(KeyboardInterrupt):
+            se_analysis.handle_stop_signal(signal.SIGTERM, None)
+
+        self.register_signal.assert_any_call(signal.SIGTERM, signal.SIG_IGN)
+        self.register_signal.assert_any_call(signal.SIGINT, signal.SIG_IGN)
+
+    def test_main_registers_the_handler_for_sigterm_and_ctrl_c(self):
+        self.run_main()
+
+        self.register_signal.assert_any_call(signal.SIGTERM, se_analysis.handle_stop_signal)
+        self.register_signal.assert_any_call(signal.SIGINT, se_analysis.handle_stop_signal)
+
+    def test_stopping_main_logs_the_batch_and_closes_the_database(self):
+        self.send(valid_record())
+
+        logged = self.run_main()
+
+        self.assertIn("Total messages: 1", logged)
+        self.assertEqual(se_analysis.stats, se_analysis.reset_stats())
+        self.assertEqual(self.db.closed, 1)
+
+    def test_client_is_closed_only_after_running_callbacks_finish(self):
+        # Closing first would drop the acks of callbacks still running.
+        self.run_main()
+
+        # The pull is cancelled, then waited on (result() returns only once
+        # running callbacks finish), and only then is the client closed. Log
+        # formatting also records unrelated calls, so only these are kept.
+        call_names = [
+            name for name, args, kwargs in self.client.mock_calls
+            if name in ("subscribe().result", "subscribe().cancel", "close")
+        ]
+        self.assertEqual(
+            call_names,
+            ["subscribe().result", "subscribe().cancel", "subscribe().result", "close"],
+        )
+        self.assertIs(
+            self.client.subscribe.call_args.kwargs["await_callbacks_on_shutdown"], True
+        )
+
+    def test_message_finishing_during_shutdown_is_in_the_final_statistics(self):
+        # A callback still running at the stop finishes inside the second
+        # result(); the statistics must be logged after it, not before.
+        def result():
+            if self.streaming_pull.result.call_count == 1:
+                raise KeyboardInterrupt
+            self.send(valid_record(trip_number="222"))
+
+        self.streaming_pull.result.side_effect = result
+        self.send(valid_record(trip_number="111"))
+
+        logged = self.run_main()
+
+        self.assertIn("Total messages: 2", logged)
+
+    def test_stop_during_reconnect_wait_still_logs_the_batch(self):
+        # The connection drops, and the stop signal lands in the 5 s sleep
+        # before reconnecting, outside the try around result().
+        self.streaming_pull.result.side_effect = [RuntimeError("connection lost"), None]
+        self.send(valid_record())
+
+        with mock.patch.object(se_analysis.time, "sleep", side_effect=KeyboardInterrupt):
+            logged = self.run_main()
+
+        self.assertEqual(self.streaming_pull.result.call_count, 2)
+        self.assertIn("Total messages: 1", logged)
+        self.assertEqual(self.db.closed, 1)
+
+    def test_failure_closing_the_client_still_logs_the_batch(self):
+        self.client.close.side_effect = RuntimeError("channel already closed")
+        self.send(valid_record())
+
+        logged = self.run_main()
+
+        self.assertIn("Error shutting down the Pub/Sub subscriber", logged)
+        self.assertIn("Total messages: 1", logged)
+        self.assertEqual(self.db.closed, 1)
+
+    def test_missing_database_credentials_fail_before_subscribing(self):
+        # Without this check every message would be nacked until someone
+        # noticed; failing at startup makes systemd report the problem.
+        # connect is patched so a future change cannot reach a real database.
+        with mock.patch.object(se_analysis, "conn", None), mock.patch.dict(
+            os.environ, clear=True
+        ), mock.patch.object(se_analysis.psycopg2, "connect") as connect:
+            with self.assertRaises(KeyError):
+                se_analysis.main()
+
+        connect.assert_not_called()
+        self.client_class.assert_not_called()
 
 
 if __name__ == "__main__":
