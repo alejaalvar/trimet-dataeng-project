@@ -485,10 +485,20 @@ class ShutdownTests(BackupTestCase):
         # Closing first would drop the acks of callbacks still running.
         self.run_main()
 
-        # mock_calls records every call on the client and the objects it
-        # returned, in order, e.g. "subscribe().result" then "close".
-        call_names = [name for name, args, kwargs in self.client.mock_calls]
-        self.assertEqual(call_names[-2:], ["subscribe().result", "close"])
+        # The pull is cancelled, then waited on (result() returns only once
+        # running callbacks finish), and only then is the client closed. Log
+        # formatting also records unrelated calls, so only these are kept.
+        call_names = [
+            name for name, args, kwargs in self.client.mock_calls
+            if name in ("subscribe().result", "subscribe().cancel", "close")
+        ]
+        self.assertEqual(
+            call_names,
+            ["subscribe().result", "subscribe().cancel", "subscribe().result", "close"],
+        )
+        self.assertIs(
+            self.client.subscribe.call_args.kwargs["await_callbacks_on_shutdown"], True
+        )
 
     def test_failure_closing_the_client_still_archives_the_batch(self):
         self.client.close.side_effect = RuntimeError("channel already closed")
