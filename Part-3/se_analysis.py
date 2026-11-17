@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 """TriMet StopEvent analysis subscriber: validate, transform, load, report."""
 
@@ -6,8 +5,9 @@ import json
 import logging
 import math
 import os
+import signal
 import time
-from datetime import date, datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Event, Lock, Thread
 
@@ -22,12 +22,18 @@ SUBSCRIPTION_ID = 'se_analysis_sub'
 IDLE_SECONDS = 300
 INVALID_DIR = Path('.')
 
-# PostgreSQL configuration
+# PostgreSQL configuration (credentials are read from the environment when
+# connecting)
 DB_HOST = 'localhost'
 DB_PORT = 5432
 DB_NAME = 'breadcrumbs'
 
-# Coordinate transformation: Oregon State Plane to WGS 84
+# Times are seconds after midnight of the service date; 30 hours leaves room
+# for trips that run well past midnight.
+MAX_SECONDS = 108000
+
+# Coordinate transformation: Oregon State Plane North (EPSG:2913, feet) to
+# WGS 84 (spec section 6.2, Transformation 2)
 _transformer = Transformer.from_crs(
     'EPSG:2913', 'EPSG:4326', always_xy=True
 )
@@ -49,17 +55,16 @@ INSERT_SQL = (
     'ON CONFLICT (vehicle_number, trip_number, arrive_time) DO NOTHING'
 )
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
+# Opened in main() and reopened by ensure_connection(), so this module can be
+# imported (e.g. by tests) without a database.
+conn = None
 
 state_lock = Lock()
 stop_event = Event()
 
 
-# Initialize statistics
 def reset_stats():
+    """Return empty statistics for a new batch."""
     return {
         'first_received': None,
         'last_received': None,
@@ -77,15 +82,12 @@ def reset_stats():
 stats = reset_stats()
 
 
-# Get a field regardless of capitalization
-def get_field(record, field):
-    if field in record:
-        return record[field]
-    return record.get(field.upper())
-
-
-# Convert value to integer
 def integer_value(value):
+    """Return value as an int, or raise ValueError if it is not a whole number.
+
+    Accepts ints, whole floats and digit strings (the publisher sends every
+    field as a string); bool is rejected even though it is an int subclass.
+    """
     if isinstance(value, bool) or value is None:
         raise ValueError('Missing or invalid integer')
 
@@ -106,12 +108,14 @@ def integer_value(value):
 
 
 def optional_int(value):
+    """Return None for a missing or empty value, otherwise integer_value(value)."""
     if value is None or value == '':
         return None
     return integer_value(value)
 
 
 def optional_float(value):
+    """Return None for a missing or empty value, otherwise a finite float."""
     if value is None or value == '':
         return None
 
@@ -123,40 +127,16 @@ def optional_float(value):
     return result
 
 
-# Parse service date
 def parse_service_date(value):
-    if isinstance(value, datetime):
-        return value.date()
-
-    if isinstance(value, date):
-        return value
-
-    if value is None:
+    """Return the service date ("YYYY-MM-DD", as se_publisher.py sends it) as a date."""
+    if not isinstance(value, str):
         raise ValueError('Missing service_date')
 
-    text = str(value).strip()
-
-    formats = (
-        '%Y-%m-%d',
-        '%Y%m%d',
-        '%d%b%Y:%H:%M:%S',
-        '%d%b%Y',
-        '%m/%d/%Y',
-        '%Y-%m-%dT%H:%M:%S',
-        '%Y-%m-%d %H:%M:%S'
-    )
-
-    for fmt in formats:
-        try:
-            return datetime.strptime(text, fmt).date()
-        except ValueError:
-            pass
-
-    raise ValueError(f'Invalid service_date: {value}')
+    return datetime.strptime(value.strip(), '%Y-%m-%d').date()
 
 
-# Convert State Plane coordinates to GPS
 def state_plane_to_latlon(x_coordinate, y_coordinate):
+    """Convert Oregon State Plane (EPSG:2913) x/y in feet to (latitude, longitude)."""
     longitude, latitude = _transformer.transform(
         float(x_coordinate),
         float(y_coordinate)
@@ -165,8 +145,12 @@ def state_plane_to_latlon(x_coordinate, y_coordinate):
     return latitude, longitude
 
 
-# Validate StopEvent record
 def validate_record(record):
+    """Check a StopEvent against assertions A1-A10 and return the violations.
+
+    An empty list means the record is valid. A1 and A2 are defined by the
+    spec; A3-A10 are ours. Every violation drops the record.
+    """
     violations = []
 
     def fail(number, description):
@@ -175,20 +159,21 @@ def validate_record(record):
             'reason': description
         })
 
-    # A1: arrive_time must be in [0, 108000]
+    # A1: arrive_time must be in [0, MAX_SECONDS]
     try:
-        arrival = integer_value(get_field(record, 'arrive_time'))
+        arrival = integer_value(record.get('arrive_time'))
 
-        if not 0 <= arrival <= 108000:
+        if not 0 <= arrival <= MAX_SECONDS:
             raise ValueError('Out of range')
 
     except (ValueError, TypeError):
         arrival = None
-        fail(1, 'arrive_time must be in [0, 108000]')
+        fail(1, f'arrive_time must be in [0, {MAX_SECONDS}]')
 
-    # A2: leave_time >= arrive_time
+    # A2: leave_time >= arrive_time when leave_time is present; a missing or
+    # malformed leave_time is A7's to report.
     try:
-        leave = integer_value(get_field(record, 'leave_time'))
+        leave = integer_value(record.get('leave_time'))
 
         if arrival is not None and leave < arrival:
             fail(2, 'leave_time must be >= arrive_time')
@@ -198,7 +183,7 @@ def validate_record(record):
 
     # A3: vehicle_number must exist and be positive
     try:
-        if integer_value(get_field(record, 'vehicle_number')) <= 0:
+        if integer_value(record.get('vehicle_number')) <= 0:
             raise ValueError('Invalid vehicle number')
 
     except (ValueError, TypeError):
@@ -206,7 +191,7 @@ def validate_record(record):
 
     # A4: trip_number must exist and be positive
     try:
-        if integer_value(get_field(record, 'trip_number')) <= 0:
+        if integer_value(record.get('trip_number')) <= 0:
             raise ValueError('Invalid trip number')
 
     except (ValueError, TypeError):
@@ -214,41 +199,41 @@ def validate_record(record):
 
     # A5: service_date must be valid
     try:
-        parse_service_date(get_field(record, 'service_date'))
+        parse_service_date(record.get('service_date'))
 
     except (ValueError, TypeError):
         fail(5, 'service_date must be a valid date')
 
-    # A6: stop_time must be null or in [0, 108000]
-    stop = get_field(record, 'stop_time')
+    # A6: stop_time must be null or in [0, MAX_SECONDS]
+    stop = record.get('stop_time')
 
     if stop is not None and stop != '':
         try:
             value = integer_value(stop)
 
-            if not 0 <= value <= 108000:
+            if not 0 <= value <= MAX_SECONDS:
                 raise ValueError('Out of range')
 
         except (ValueError, TypeError):
-            fail(6, 'stop_time must be null or in [0, 108000]')
+            fail(6, f'stop_time must be null or in [0, {MAX_SECONDS}]')
 
-    # A7: leave_time must be null or in [0, 108000]
-    leave = get_field(record, 'leave_time')
+    # A7: leave_time must be null or in [0, MAX_SECONDS]
+    leave = record.get('leave_time')
 
     if leave is not None and leave != '':
         try:
             value = integer_value(leave)
 
-            if not 0 <= value <= 108000:
+            if not 0 <= value <= MAX_SECONDS:
                 raise ValueError('Out of range')
 
         except (ValueError, TypeError):
-            fail(7, 'leave_time must be null or in [0, 108000]')
+            fail(7, f'leave_time must be null or in [0, {MAX_SECONDS}]')
 
     # A8: Coordinates must convert to valid GPS values
     try:
-        x = optional_float(get_field(record, 'x_coordinate'))
-        y = optional_float(get_field(record, 'y_coordinate'))
+        x = optional_float(record.get('x_coordinate'))
+        y = optional_float(record.get('y_coordinate'))
 
         if x is None or y is None:
             raise ValueError('Missing coordinates')
@@ -268,7 +253,7 @@ def validate_record(record):
 
     # A9: Passenger counts must be non-negative
     for field in ('ons', 'offs', 'estimated_load'):
-        value = get_field(record, field)
+        value = record.get(field)
 
         if value is not None and value != '':
             try:
@@ -279,7 +264,7 @@ def validate_record(record):
                 fail(9, f'{field} must be non-negative')
 
     # A10: dwell must be non-negative
-    dwell = get_field(record, 'dwell')
+    dwell = record.get('dwell')
 
     if dwell is not None and dwell != '':
         try:
@@ -292,11 +277,15 @@ def validate_record(record):
     return violations
 
 
-# Transform validated record
 def transform_record(record):
-    service_date = parse_service_date(
-        get_field(record, 'service_date')
-    )
+    """Return a validated StopEvent as a dict of DB_COLUMNS values.
+
+    Transformation 1: arrive/stop/leave seconds become datetimes relative to
+    midnight of the service date (past 86,400 s they roll into the next day).
+    Transformation 2: x/y State Plane coordinates become GPS latitude and
+    longitude, replacing them.
+    """
+    service_date = parse_service_date(record.get('service_date'))
 
     midnight = datetime.combine(
         service_date,
@@ -307,21 +296,20 @@ def transform_record(record):
 
     for column in DB_COLUMNS:
 
-        # Convert seconds since midnight into timestamps
         if column in ('arrive_time', 'leave_time', 'stop_time'):
-            seconds = optional_int(get_field(record, column))
+            seconds = optional_int(record.get(column))
 
             transformed[column] = (
                 midnight + timedelta(seconds=seconds)
                 if seconds is not None else None
             )
 
-        # GPS coordinates are generated separately
+        # Computed from x/y below
         elif column in ('gps_latitude', 'gps_longitude'):
             continue
 
         elif column == 'service_key':
-            value = get_field(record, column)
+            value = record.get(column)
             transformed[column] = (
                 str(value) if value is not None else None
             )
@@ -331,19 +319,14 @@ def transform_record(record):
             'pattern_distance',
             'location_distance'
         ):
-            transformed[column] = optional_float(
-                get_field(record, column)
-            )
+            transformed[column] = optional_float(record.get(column))
 
         else:
-            transformed[column] = optional_int(
-                get_field(record, column)
-            )
+            transformed[column] = optional_int(record.get(column))
 
-    # Convert State Plane coordinates to GPS
     lat, lon = state_plane_to_latlon(
-        get_field(record, 'x_coordinate'),
-        get_field(record, 'y_coordinate')
+        record.get('x_coordinate'),
+        record.get('y_coordinate')
     )
 
     transformed['gps_latitude'] = lat
@@ -352,8 +335,8 @@ def transform_record(record):
     return transformed
 
 
-# Save invalid records to daily file
 def save_invalid(record, violations, received_at):
+    """Append a dropped record and its violations to the day's invalid file."""
     INVALID_DIR.mkdir(parents=True, exist_ok=True)
 
     filename = INVALID_DIR / (
@@ -378,8 +361,21 @@ def save_invalid(record, violations, received_at):
         )
 
 
-# Track received messages
-def record_receive(received_at, received_mono):
+def record_receive(received_at, received_mono, record):
+    """Count one processed message, its vehicle and trip, and update the receive times.
+
+    Vehicles and trips are counted for every received record, valid or not,
+    because the spec (section 8) expects the subscriber's vehicle count to
+    agree with the publisher's.
+    """
+    # str() so 4001 and "4001" count once, and so an odd value such as a
+    # list cannot raise TypeError and get the message nacked forever.
+    if isinstance(record, dict):
+        if record.get('vehicle_number') is not None:
+            stats['vehicle_ids'].add(str(record['vehicle_number']))
+        if record.get('trip_number') is not None:
+            stats['trip_ids'].add(str(record['trip_number']))
+
     if stats['first_received'] is None:
         stats['first_received'] = received_at
         stats['first_monotonic'] = received_mono
@@ -390,8 +386,8 @@ def record_receive(received_at, received_mono):
     stats['received_count'] += 1
 
 
-# Log batch statistics
 def log_stats():
+    """Log the current batch's statistics (spec section 8)."""
     elapsed = (
         stats['last_monotonic']
         - stats['first_monotonic']
@@ -452,189 +448,252 @@ def log_stats():
     logging.info('==================================================')
 
 
-# Connect to PostgreSQL
-db_user = os.environ['DB_USER']
-db_password = os.environ['DB_PASSWORD']
+def ensure_connection():
+    """Return the database connection, opening a new one if there is none or it was closed."""
+    global conn
 
-conn = psycopg2.connect(
-    host=DB_HOST,
-    port=DB_PORT,
-    dbname=DB_NAME,
-    user=db_user,
-    password=db_password
-)
+    if conn is None or conn.closed:
+        conn = psycopg2.connect(
+            host=DB_HOST,
+            port=DB_PORT,
+            dbname=DB_NAME,
+            user=os.environ['DB_USER'],
+            password=os.environ['DB_PASSWORD'],
+            # Reconnecting happens while holding state_lock; a server that
+            # never answers must not block every callback forever.
+            connect_timeout=10
+        )
+        conn.autocommit = True
 
-conn.autocommit = True
-
-
-# Initialize Pub/Sub subscriber
-subscriber = pubsub_v1.SubscriberClient()
-
-sub_path = subscriber.subscription_path(
-    PROJECT_ID,
-    SUBSCRIPTION_ID
-)
+    return conn
 
 
-# Process incoming StopEvent messages
-def callback(message):
-    received_at = datetime.now(timezone.utc)
-    received_mono = time.monotonic()
+def close_connection():
+    """Close and forget the database connection so the next insert reconnects."""
+    global conn
 
+    old, conn = conn, None
+
+    if old is not None:
+        old.close()
+
+
+def insert_record(transformed):
+    """Insert one transformed StopEvent; return 1 if stored, 0 if it was already there."""
     try:
-        raw = message.data.decode('utf-8')
-        record = json.loads(raw)
-
-        if not isinstance(record, dict):
-            raise ValueError('Expected JSON object')
-
-    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
-        try:
-            with state_lock:
-                save_invalid(
-                    message.data.decode(
-                        'utf-8',
-                        errors='replace'
-                    ),
-                    [{
-                        'assertion': 'FORMAT',
-                        'reason': str(error)
-                    }],
-                    received_at
+        with ensure_connection().cursor() as cursor:
+            cursor.execute(
+                INSERT_SQL,
+                tuple(
+                    transformed[column]
+                    for column in DB_COLUMNS
                 )
-
-                record_receive(received_at, received_mono)
-                stats['invalid_count'] += 1
-
-            message.ack()
-
-        except Exception:
-            logging.exception(
-                'Failed to save malformed StopEvent'
             )
-            message.nack()
 
-        return
+            return cursor.rowcount
 
+    except (psycopg2.OperationalError, psycopg2.InterfaceError):
+        # The connection is unusable (e.g. PostgreSQL restarted); without
+        # dropping it, every later insert would fail on the dead connection.
+        close_connection()
+        raise
+
+
+def reject(message, record, violations, received_at, received_mono):
+    """Save a record that can never be loaded to the invalid file, count it and ack it.
+
+    Acking, rather than nacking, keeps Pub/Sub from redelivering a record
+    that would fail the same way every time.
+    """
     try:
-        # Validate record before transformation
-        violations = validate_record(record)
-
-        transformed = None
-
-        if not violations:
-            try:
-                transformed = transform_record(record)
-
-            except (ValueError, TypeError, OverflowError) as error:
-                violations.append({
-                    'assertion': 'TRANSFORM',
-                    'reason': str(error)
-                })
-
         with state_lock:
-
-            # Drop invalid records and save original JSON
-            if violations:
-                save_invalid(record, violations, received_at)
-                record_receive(received_at, received_mono)
-
-                stats['invalid_count'] += 1
-
-            else:
-                # Insert transformed record into PostgreSQL
-                with conn.cursor() as cursor:
-                    cursor.execute(
-                        INSERT_SQL,
-                        tuple(
-                            transformed[column]
-                            for column in DB_COLUMNS
-                        )
-                    )
-
-                    inserted = cursor.rowcount
-
-                record_receive(received_at, received_mono)
-
-                stats['inserted_count'] += inserted
-                stats['duplicate_count'] += (1 - inserted)
-
-                stats['vehicle_ids'].add(
-                    transformed['vehicle_number']
-                )
-
-                stats['trip_ids'].add(
-                    transformed['trip_number']
-                )
+            save_invalid(record, violations, received_at)
+            record_receive(received_at, received_mono, record)
+            stats['invalid_count'] += 1
 
         message.ack()
 
     except Exception:
-        logging.exception(
-            'StopEvent processing failed; retrying message'
-        )
+        logging.exception('Failed to save invalid StopEvent')
         message.nack()
 
 
-# Detect batch completion after inactivity
-def check_batch_completion():
+def callback(message):
+    """Validate, transform and load one StopEvent message.
+
+    Malformed, invalid and table-rejected records go to the invalid file and
+    are acked; any other failure (e.g. a lost database connection) is nacked
+    so Pub/Sub redelivers the message.
+    """
+    received_at = datetime.now(timezone.utc)
+    received_mono = time.monotonic()
+
+    # UnicodeDecodeError and JSONDecodeError are both ValueErrors.
+    try:
+        record = json.loads(message.data.decode('utf-8'))
+
+        if not isinstance(record, dict):
+            raise ValueError('Expected JSON object')
+
+    except ValueError as error:
+        reject(
+            message,
+            message.data.decode('utf-8', errors='replace'),
+            [{'assertion': 'FORMAT', 'reason': str(error)}],
+            received_at,
+            received_mono
+        )
+        return
+
+    # Validation and transformation depend only on the record, so an
+    # unexpected error (e.g. from pyproj) would repeat on every redelivery.
+    try:
+        violations = validate_record(record)
+        transformed = None if violations else transform_record(record)
+
+    except Exception as error:
+        violations = [{'assertion': 'TRANSFORM', 'reason': str(error)}]
+
+    if violations:
+        reject(message, record, violations, received_at, received_mono)
+        return
+
+    try:
+        with state_lock:
+            inserted = insert_record(transformed)
+
+            record_receive(received_at, received_mono, record)
+
+            stats['inserted_count'] += inserted
+            stats['duplicate_count'] += (1 - inserted)
+
+        message.ack()
+
+    # The table rejected this record's values (e.g. a number too large for a
+    # SMALLINT column), which no retry can fix.
+    except (psycopg2.DataError, psycopg2.IntegrityError) as error:
+        reject(
+            message,
+            record,
+            [{'assertion': 'DATABASE', 'reason': str(error)}],
+            received_at,
+            received_mono
+        )
+
+    except Exception:
+        logging.exception('StopEvent processing failed; retrying message')
+        message.nack()
+
+
+def finish_batch_locked():
+    """Log the current batch's statistics and start a new batch.
+
+    The caller must hold `state_lock`. Does nothing if no messages were
+    received.
+    """
     global stats
 
+    if stats['received_count'] == 0:
+        return
+
+    log_stats()
+    stats = reset_stats()
+
+
+def finish_batch():
+    """Finish the current batch now (see finish_batch_locked)."""
+    with state_lock:
+        finish_batch_locked()
+
+
+def finish_if_idle():
+    """Finish the batch once no message has arrived for IDLE_SECONDS.
+
+    Pub/Sub has no end-of-batch signal, so a long silence is taken to mean
+    the publisher is done for the day. The check and the finish happen under
+    one hold of the lock so a message arriving in between cannot be counted
+    in the batch being closed.
+    """
+    with state_lock:
+        if stats['received_count'] == 0:
+            return
+
+        idle = time.monotonic() - stats['last_monotonic']
+
+        if idle >= IDLE_SECONDS:
+            logging.info('StopEvent batch idle for %.0f seconds.', idle)
+            finish_batch_locked()
+
+
+def check_batch_completion():
+    """Check every 5 seconds whether the batch has gone idle, until shutdown."""
     while not stop_event.wait(5):
-        with state_lock:
+        try:
+            finish_if_idle()
 
-            if stats['received_count'] == 0:
-                continue
-
-            idle = (
-                time.monotonic()
-                - stats['last_monotonic']
-            )
-
-            if idle >= IDLE_SECONDS:
-                log_stats()
-
-                logging.info(
-                    'StopEvent batch complete after %.0f seconds idle',
-                    idle
-                )
-
-                stats = reset_stats()
+        except Exception:
+            logging.exception('Error finishing StopEvent batch')
 
 
-# Start background checker
-checker = Thread(
-    target=check_batch_completion,
-    daemon=True
-)
+def handle_stop_signal(signum, frame):
+    """Turn Ctrl+C or systemd's SIGTERM into one KeyboardInterrupt so the batch is reported.
 
-checker.start()
-
-logging.info(
-    'StopEvent subscriber listening on %s (topic %s)',
-    sub_path,
-    TOPIC_ID
-)
+    The VM shuts down at the end of its daily window and systemd stops this
+    service with SIGTERM, whose Python default exits at once without the
+    final statistics. Later stop signals are ignored so a second Ctrl+C or
+    SIGTERM cannot interrupt the shutdown itself.
+    """
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    raise KeyboardInterrupt
 
 
-# Run subscriber automatically
-try:
-    with subscriber:
+def main():
+    """Validate and load StopEvents from se_analysis_sub until stopped."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s'
+    )
 
+    signal.signal(signal.SIGTERM, handle_stop_signal)
+    signal.signal(signal.SIGINT, handle_stop_signal)
+
+    # Connecting before subscribing makes bad credentials fail at startup
+    # instead of nacking every message.
+    ensure_connection()
+
+    subscriber = pubsub_v1.SubscriberClient()
+
+    sub_path = subscriber.subscription_path(
+        PROJECT_ID,
+        SUBSCRIPTION_ID
+    )
+
+    checker = Thread(
+        target=check_batch_completion,
+        daemon=True
+    )
+
+    checker.start()
+
+    logging.info(
+        'StopEvent subscriber listening on %s (topic %s)',
+        sub_path,
+        TOPIC_ID
+    )
+
+    streaming_pull = None
+
+    try:
         while not stop_event.is_set():
             streaming_pull = subscriber.subscribe(
                 sub_path,
-                callback=callback
+                callback=callback,
+                await_callbacks_on_shutdown=True
             )
 
             try:
                 streaming_pull.result()
-
-            except KeyboardInterrupt:
-                logging.info('Stopping StopEvent subscriber...')
-                stop_event.set()
-                streaming_pull.cancel()
-                break
 
             except Exception:
                 logging.exception(
@@ -642,14 +701,43 @@ try:
                 )
 
                 streaming_pull.cancel()
-                stop_event.wait(5)
+                time.sleep(5)
 
-finally:
-    stop_event.set()
-    checker.join(timeout=2)
+    # Caught here rather than around result() alone, because the stop signal
+    # can arrive anywhere in the loop, including the reconnect sleep.
+    # KeyboardInterrupt is not an Exception, so the handler above skips it.
+    except KeyboardInterrupt:
+        logging.info('Stopping StopEvent subscriber...')
 
-    with state_lock:
-        if stats['received_count'] > 0:
-            log_stats()
+    finally:
+        stop_event.set()
 
-    conn.close()
+        # cancel() does not wait for running callbacks; with
+        # await_callbacks_on_shutdown=True this result() does, so the final
+        # statistics include every message and no insert races the close.
+        # A failure here must not stop the statistics from being logged.
+        try:
+            if streaming_pull is not None:
+                streaming_pull.cancel()
+
+                try:
+                    streaming_pull.result()
+                except Exception:
+                    pass
+
+            subscriber.close()
+
+        except Exception:
+            logging.exception('Error shutting down the Pub/Sub subscriber')
+
+        try:
+            finish_batch()
+
+        except Exception:
+            logging.exception('Failed to log final StopEvent statistics')
+
+        close_connection()
+
+
+if __name__ == '__main__':
+    main()
