@@ -8,11 +8,17 @@ Run from the Part-3 directory:
     python3 -m unittest discover -s tests -v
 """
 
+import glob
+import json
 import os
 import sys
+import tempfile
 import unittest
 from datetime import datetime
+from pathlib import Path
 from unittest import mock
+
+import psycopg2
 
 PART3_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PART3_DIR)
@@ -258,6 +264,256 @@ class TransformRecordTests(unittest.TestCase):
         self.assertIsNone(row["route_number"])
         self.assertIsNone(row["train_mileage"])
         self.assertIsNone(row["service_key"])
+
+
+class FakeCursor:
+    """Records INSERTs in its connection; raises the connection's `error` if set."""
+
+    def __init__(self, connection):
+        self.connection = connection
+        self.rowcount = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def execute(self, sql, values):
+        if self.connection.error is not None:
+            raise self.connection.error
+        self.connection.inserts.append((sql, values))
+        self.rowcount = self.connection.rowcount
+
+
+class FakeConnection:
+    """Stands in for a psycopg2 connection.
+
+    rowcount is what each INSERT reports: 1 stored, 0 skipped by ON CONFLICT.
+    """
+
+    def __init__(self):
+        self.inserts = []
+        self.rowcount = 1
+        self.error = None
+        self.closed = 0
+
+    def cursor(self):
+        return FakeCursor(self)
+
+    def close(self):
+        self.closed = 1
+
+
+class AnalysisTestCase(unittest.TestCase):
+    """Gives each test a fake database, an empty invalid-records dir and fresh stats."""
+
+    def setUp(self):
+        """Replace the database connection, INVALID_DIR and stats for one test."""
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.invalid_dir = Path(tmp.name)
+
+        dir_patcher = mock.patch.object(se_analysis, "INVALID_DIR", self.invalid_dir)
+        dir_patcher.start()
+        self.addCleanup(dir_patcher.stop)
+
+        self.db = FakeConnection()
+        conn_patcher = mock.patch.object(se_analysis, "conn", self.db)
+        conn_patcher.start()
+        self.addCleanup(conn_patcher.stop)
+
+        # stats is module state that callback() fills, so each test starts
+        # from (and leaves behind) a clean copy.
+        original_stats = se_analysis.stats
+        se_analysis.stats = se_analysis.reset_stats()
+        self.addCleanup(setattr, se_analysis, "stats", original_stats)
+
+    def send(self, data):
+        """Deliver one message to callback() and return it; a dict is sent as JSON."""
+        if isinstance(data, dict):
+            data = json.dumps(data).encode("utf-8")
+        msg = mock.Mock(data=data)
+        se_analysis.callback(msg)
+        return msg
+
+    def invalid_entries(self):
+        """Return every entry written to the invalid-records files."""
+        entries = []
+        for path in glob.glob(str(self.invalid_dir / "se_invalid_data_*.jsonl")):
+            with open(path, encoding="utf-8") as file:
+                entries.extend(json.loads(line) for line in file)
+        return entries
+
+    def inserted_value(self, column, insert=0):
+        """Return the value sent for `column` in the given INSERT."""
+        _, values = self.db.inserts[insert]
+        return values[se_analysis.DB_COLUMNS.index(column)]
+
+
+class CallbackTests(AnalysisTestCase):
+    """callback() loads valid StopEvents and sets the rest aside."""
+
+    def test_valid_record_is_inserted_and_acked(self):
+        msg = self.send(valid_record())
+
+        self.assertEqual(len(self.db.inserts), 1)
+        self.assertEqual(self.db.inserts[0][0], se_analysis.INSERT_SQL)
+        self.assertEqual(self.inserted_value("trip_number"), 242538843)
+        self.assertEqual(self.inserted_value("arrive_time"), datetime(2023, 1, 21, 6, 55, 2))
+        self.assertAlmostEqual(self.inserted_value("gps_latitude"), 45.49086, delta=1e-6)
+        msg.ack.assert_called_once()
+        msg.nack.assert_not_called()
+        self.assertEqual(se_analysis.stats["inserted_count"], 1)
+
+    def test_invalid_record_is_saved_with_its_violations_and_not_inserted(self):
+        record = valid_record(arrive_time="abc")
+
+        with self.assertLogs(level="WARNING"):
+            msg = self.send(record)
+
+        self.assertEqual(self.db.inserts, [])
+        [entry] = self.invalid_entries()
+        self.assertEqual(entry["record"], record)
+        self.assertEqual([v["assertion"] for v in entry["violations"]], ["A1"])
+        msg.ack.assert_called_once()
+        msg.nack.assert_not_called()
+        self.assertEqual(se_analysis.stats["invalid_count"], 1)
+        self.assertEqual(se_analysis.stats["received_count"], 1)
+
+    def test_malformed_messages_are_saved_and_acked(self):
+        # Not JSON, JSON that is not an object, and bytes that are not UTF-8.
+        for count, data in enumerate((b"not json", b"[1, 2]", b"\xff\xfe"), start=1):
+            with self.subTest(data=data):
+                with self.assertLogs(level="WARNING"):
+                    msg = self.send(data)
+
+                entries = self.invalid_entries()
+                self.assertEqual(len(entries), count)
+                self.assertEqual(entries[-1]["violations"][0]["assertion"], "FORMAT")
+                msg.ack.assert_called_once()
+                msg.nack.assert_not_called()
+
+        self.assertEqual(self.db.inserts, [])
+        self.assertEqual(se_analysis.stats["invalid_count"], 3)
+
+    def test_duplicate_is_counted_and_acked(self):
+        # ON CONFLICT ... DO NOTHING reports 0 rows for an already-stored stop.
+        self.db.rowcount = 0
+
+        msg = self.send(valid_record())
+
+        self.assertEqual(len(self.db.inserts), 1)
+        msg.ack.assert_called_once()
+        msg.nack.assert_not_called()
+        self.assertEqual(self.invalid_entries(), [])
+        self.assertEqual(se_analysis.stats["inserted_count"], 0)
+        self.assertEqual(se_analysis.stats["duplicate_count"], 1)
+
+    def test_value_rejected_by_the_table_is_saved_and_acked(self):
+        # Retrying cannot fix a value the column rejects, so it must not be
+        # nacked into an endless redelivery loop.
+        self.db.error = psycopg2.DataError("smallint out of range")
+
+        with self.assertLogs(level="WARNING"):
+            msg = self.send(valid_record())
+
+        [entry] = self.invalid_entries()
+        self.assertEqual(entry["violations"][0]["assertion"], "DATABASE")
+        msg.ack.assert_called_once()
+        msg.nack.assert_not_called()
+        self.assertEqual(se_analysis.stats["invalid_count"], 1)
+        self.assertEqual(se_analysis.stats["received_count"], 1)
+        self.assertEqual(se_analysis.stats["inserted_count"], 0)
+        self.assertEqual(se_analysis.stats["duplicate_count"], 0)
+
+    def test_constraint_violation_is_saved_and_acked(self):
+        self.db.error = psycopg2.IntegrityError("null value in column violates not-null")
+
+        with self.assertLogs(level="WARNING"):
+            msg = self.send(valid_record())
+
+        [entry] = self.invalid_entries()
+        self.assertEqual(entry["violations"][0]["assertion"], "DATABASE")
+        msg.ack.assert_called_once()
+        msg.nack.assert_not_called()
+
+    def test_lost_connection_is_nacked_and_the_next_message_reconnects(self):
+        self.db.error = psycopg2.OperationalError("server closed the connection")
+
+        with self.assertLogs(level="ERROR"):
+            first = self.send(valid_record())
+
+        first.nack.assert_called_once()
+        first.ack.assert_not_called()
+        self.assertEqual(self.db.closed, 1)
+        # Not counted yet: Pub/Sub redelivers it, and it is counted then.
+        self.assertEqual(se_analysis.stats["received_count"], 0)
+
+        new_db = FakeConnection()
+        credentials = {"DB_USER": "test", "DB_PASSWORD": "test"}
+        with mock.patch.dict(os.environ, credentials), mock.patch.object(
+            se_analysis.psycopg2, "connect", return_value=new_db
+        ):
+            second = self.send(valid_record())
+
+        self.assertEqual(len(new_db.inserts), 1)
+        second.ack.assert_called_once()
+        self.assertEqual(se_analysis.stats["received_count"], 1)
+
+    def test_unexpected_validation_error_is_saved_and_acked(self):
+        # An error that depends only on the record would repeat on every
+        # redelivery, so the record is set aside instead of nacked.
+        with mock.patch.object(
+            se_analysis, "state_plane_to_latlon", side_effect=RuntimeError("PROJ failure")
+        ):
+            with self.assertLogs(level="WARNING"):
+                msg = self.send(valid_record())
+
+        [entry] = self.invalid_entries()
+        self.assertEqual(entry["violations"][0]["assertion"], "TRANSFORM")
+        msg.ack.assert_called_once()
+        msg.nack.assert_not_called()
+
+    def test_unexpected_transformation_error_is_saved_and_acked(self):
+        with mock.patch.object(
+            se_analysis, "transform_record", side_effect=RuntimeError("unexpected")
+        ):
+            with self.assertLogs(level="WARNING"):
+                msg = self.send(valid_record())
+
+        [entry] = self.invalid_entries()
+        self.assertEqual(entry["violations"][0]["assertion"], "TRANSFORM")
+        msg.ack.assert_called_once()
+        msg.nack.assert_not_called()
+
+    def test_failure_to_save_an_invalid_record_is_nacked(self):
+        # INVALID_DIR points at a regular file, so the invalid file cannot be
+        # written; the record must be redelivered rather than lost.
+        blocker = self.invalid_dir / "not_a_dir"
+        blocker.write_text("")
+
+        with mock.patch.object(se_analysis, "INVALID_DIR", blocker):
+            with self.assertLogs(level="ERROR"):
+                msg = self.send(valid_record(arrive_time="abc"))
+
+        msg.nack.assert_called_once()
+        msg.ack.assert_not_called()
+        # Not counted yet: Pub/Sub redelivers it, and it is counted then.
+        self.assertEqual(se_analysis.stats["invalid_count"], 0)
+        self.assertEqual(se_analysis.stats["received_count"], 0)
+        self.assertEqual(se_analysis.stats["vehicle_ids"], set())
+
+    def test_vehicles_and_trips_are_counted_for_valid_and_invalid_records(self):
+        # The spec expects the subscriber's vehicle count to match the
+        # publisher's, which counts every record it sent.
+        self.send(valid_record(vehicle_number="4001", trip_number="111"))
+        with self.assertLogs(level="WARNING"):
+            self.send(valid_record(vehicle_number="4002", trip_number="222", arrive_time="abc"))
+
+        self.assertEqual(se_analysis.stats["vehicle_ids"], {"4001", "4002"})
+        self.assertEqual(se_analysis.stats["trip_ids"], {"111", "222"})
+        self.assertEqual(se_analysis.stats["received_count"], 2)
 
 
 if __name__ == "__main__":
